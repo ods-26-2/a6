@@ -1,3 +1,50 @@
+## Configuração do ambiente (uv)
+
+O projeto usa **dois ambientes virtuais separados**, criados com o [uv](https://docs.astral.sh/uv/), porque o `bpy` (Blender como biblioteca) exige uma versão específica do Python, diferente da usada pelo visualizador.
+
+| Ambiente | Python | Arquivo de dependências |
+|---|---|---|
+| `.venv/generic` | 3.14 | `reqs.txt` |
+| `.venv/blender` | 3.11 | `req_blender.txt` |
+
+### 1. Instalar o uv
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+source $HOME/.local/bin/env
+```
+
+Confira com `uv --version`.
+
+### 2. Clonar o repositório
+
+```bash
+git clone <url-do-repositorio>
+cd <pasta-do-repositorio>
+```
+
+### 3. Criar os ambientes
+
+```bash
+# Ambiente geral
+uv venv --python 3.14 .venv/standard
+uv pip install --python .venv/standard/bin/python -r reqs.txt
+
+# Ambiente do Blender (bpy)
+uv venv --python 3.11 .venv/blender
+uv pip install --python .venv/blender/bin/python -r req_blender.txt
+```
+
+### 4. Atualizar as dependências
+
+Depois de instalar um pacote novo, regenere o arquivo do ambiente correspondente:
+
+```bash
+uv pip freeze --python .venv/standard/bin/python > reqs.txt
+uv pip freeze --python .venv/blender/bin/python > req_blender.txt
+```
+
 #  Mapeamento Geométrico das Expressões Não-Manuais (ENMs) em LIBRAS
 
 Na Língua Brasileira de Sinais (LIBRAS), as **Expressões Não-Manuais (ENMs)** desempenham um papel gramatical fundamental para definir a intenção (perguntas, afirmações, negações) e a intensidade dos sinais.
