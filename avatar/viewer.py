@@ -18,6 +18,7 @@ Controles:
     ESC                         : sair
 """
 import math
+import os
 import sys
 
 from direct.actor.Actor import Actor
@@ -26,7 +27,7 @@ from direct.showbase.ShowBase import ShowBase
 from panda3d.core import (AmbientLight, DirectionalLight, Filename, TextNode,
                           Vec3, loadPrcFileData)
 
-loadPrcFileData("", "window-title Avatar Libras\nwin-size 1024 768\nmultisamples 4")
+loadPrcFileData("", "window-title Avatar Libras\nwin-size 1024 768\nmultisamples 4\naudio-library-name null")
 
 try:
     import gltf  # panda3d-gltf
@@ -43,6 +44,9 @@ class Viewer(ShowBase):
         self.setBackgroundColor(0.85, 0.88, 0.95)
         self.disableMouse()
 
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            sys.exit(f"Arquivo nao encontrado: {path}")
         self.actor = Actor(Filename.from_os_specific(path))
         self.actor.reparentTo(self.render)
         self.actor.setTwoSided(True)

@@ -19,6 +19,7 @@ Formato de entrada (um JSON por frame):
 """
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -44,21 +45,32 @@ POSE_ARM = {"Left": (11, 13, 15), "Right": (12, 14, 16)}
 # --------------------------------------------------------------------------
 # Entrada de dados
 # --------------------------------------------------------------------------
-def to_world(kp, w, h):
+def to_world(kp, w, h, mirror=False):
     """MediaPipe (x dir, y baixo, z profundidade; normalizado) -> mundo Blender
-    (X dir, Y para longe da camera, Z cima). Avatar olha para -Y (para o espectador)."""
-    return Vector((kp["x"] * w, kp["z"] * w, -kp["y"] * h))
+    (X dir, Y para longe da camera, Z cima). Avatar olha para -Y (para o espectador).
+    mirror=True inverte o eixo X (espelha a pose)."""
+    sx = -1.0 if mirror else 1.0
+    return Vector((sx * kp["x"] * w, kp["z"] * w, -kp["y"] * h))
 
 
-def load_frame(path, w, h, swap_hand_labels):
+# Indices do MediaPipe Pose que trocam de lado ao espelhar
+_POSE_SWAP = {11: 12, 12: 11, 13: 14, 14: 13, 15: 16, 16: 15}
+
+
+def load_frame(path, w, h, swap_hand_labels, mirror=False):
     d = json.loads(Path(path).read_text(encoding="utf-8"))
+    # espelhar inverte a anatomia: a mao esquerda vira direita e vice-versa
+    do_swap = swap_hand_labels != mirror
     hands = {}
     for m in d.get("maos", []):
         label = m["lado"]
-        if swap_hand_labels:  # MediaPipe assume imagem espelhada
+        if do_swap:  # MediaPipe assume imagem espelhada
             label = "Left" if label == "Right" else "Right"
-        hands[label] = {k["id"]: to_world(k, w, h) for k in m["keypoints"]}
-    pose = {k["id"]: to_world(k, w, h) for k in d.get("corpo", [])}
+        hands[label] = {k["id"]: to_world(k, w, h, mirror) for k in m["keypoints"]}
+    pose = {}
+    for k in d.get("corpo", []):
+        idx = _POSE_SWAP.get(k["id"], k["id"]) if mirror else k["id"]
+        pose[idx] = to_world(k, w, h, mirror)
     return {"hands": hands, "pose": pose}
 
 
@@ -92,17 +104,19 @@ def load_model(path):
     arms = [o for o in bpy.context.scene.objects if o.type == "ARMATURE"]
     if not arms:
         sys.exit("O modelo nao tem armature (esqueleto).")
-    return arms[0]
+    arm = arms[0]
+    # O FBX do Mixamo costuma trazer uma "animacao" de 1 frame (a T-pose) que
+    # sobrescreve a pose manual a cada frame_set/render. Removemos.
+    arm.animation_data_clear()
+    arm.data.pose_position = "POSE"
+    return arm
 
 
-def setup_camera_and_render(scene, res, cam_dist, cam_height, look_height):
+def setup_scene(scene, res):
     cam_data = bpy.data.cameras.new("cam")
     cam = bpy.data.objects.new("cam", cam_data)
     scene.collection.objects.link(cam)
-    cam.location = Vector((0, -cam_dist, cam_height))
-    direction = Vector((0, 0, look_height)) - cam.location
-    cam.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
-    scene.camera = cam
+    scene.camera = cam   # posicionada depois por frame_camera()
 
     scene.render.engine = "BLENDER_WORKBENCH"        # roda sem GPU / headless
     scene.display.shading.light = "STUDIO"
@@ -176,6 +190,69 @@ class Rig:
 # --------------------------------------------------------------------------
 # Aplicacao da pose
 # --------------------------------------------------------------------------
+def face_front(rig):
+    """Gira o avatar em Z para ele olhar para -Y (de frente para a camera),
+    independente de como o FBX/GLB foi importado."""
+    L, R = rig.bone("LeftArm"), rig.bone("RightArm")
+    if not (L and R):
+        return
+    mw = rig.arm.matrix_world
+    fwd = (mw @ L.head - mw @ R.head).cross(Vector((0, 0, 1)))
+    fwd.z = 0
+    if fwd.length < 1e-9:
+        return
+    fwd.normalize()
+    front = Vector((0, -1, 0))
+    angle = fwd.angle(front)
+    if fwd.cross(front).z < 0:
+        angle = -angle
+    from mathutils import Matrix
+    rig.arm.matrix_world = Matrix.Rotation(angle, 4, "Z") @ rig.arm.matrix_world
+    bpy.context.view_layer.update()
+
+
+def frame_camera(scene, rig, focus, margin):
+    """Posiciona a camera pelo tamanho real do avatar (nao depende de escala/unidade)."""
+    pts = [o.matrix_world @ Vector(c)
+           for o in scene.objects if o.type == "MESH" for c in o.bound_box]
+    if not pts:
+        return
+    mn = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+    mx = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+    height = mx.z - mn.z
+    center = (mn + mx) / 2
+
+    mw = rig.arm.matrix_world
+    wrists = [mw @ pb.head for pb in (rig.bone("LeftHand"), rig.bone("RightHand")) if pb]
+    print(f"DEBUG malha: min={tuple(round(v, 3) for v in mn)} max={tuple(round(v, 3) for v in mx)}")
+    for w in wrists:
+        print(f"DEBUG punho: {tuple(round(v, 3) for v in w)}")
+
+    if focus == "full":
+        target = Vector((center.x, center.y, mn.z + height * 0.50))
+        visible = height * 1.10
+    elif focus == "hands" and wrists:
+        pts_h = wrists + [wrists[0] + Vector((0, 0, height * 0.12))]
+        lo = Vector((min(p.x for p in pts_h), 0, min(p.z for p in pts_h)))
+        hi = Vector((max(p.x for p in pts_h), 0, max(p.z for p in pts_h)))
+        target = Vector(((lo.x + hi.x) / 2, center.y, (lo.z + hi.z) / 2))
+        visible = max(hi.x - lo.x, hi.z - lo.z, height * 0.25) * 1.6
+    else:  # "auto": cabeca ate cintura, sempre incluindo os punhos reais
+        zs = [mx.z, mn.z + height * 0.40] + [w.z for w in wrists]
+        xs = [center.x - height * 0.20, center.x + height * 0.20] + [w.x for w in wrists]
+        target = Vector(((min(xs) + max(xs)) / 2, center.y, (min(zs) + max(zs)) / 2))
+        visible = max(max(zs) - min(zs), max(xs) - min(xs)) * 1.25
+
+    visible *= margin
+    cam = scene.camera
+    dist = (visible / 2) / math.tan(cam.data.angle / 2) + (mx.y - mn.y) / 2
+    cam.data.clip_start = dist * 0.01
+    cam.data.clip_end = dist * 20
+    cam.location = target + Vector((0, -dist, 0))
+    cam.rotation_euler = (target - cam.location).to_track_quat("-Z", "Y").to_euler()
+    print(f"Avatar: altura={height:.3f}  camera a {dist:.3f} (foco={focus})")
+
+
 def default_stance(rig):
     """Bracos em posicao de 'sinalizar' quando nao ha keypoints de corpo."""
     for side, sx in (("Left", 1), ("Right", -1)):   # avatar: Left em +X
@@ -227,14 +304,17 @@ def main():
     ap.add_argument("--height", type=int, default=720, help="altura da imagem original")
     ap.add_argument("--keep-labels", action="store_true",
                     help="NAO inverter Left/Right das maos (use se a imagem original estava espelhada)")
+    ap.add_argument("--mirror", action="store_true",
+                    help="espelha a pose (use se a imagem original era de camera 'selfie'/espelhada)")
     ap.add_argument("--smooth", type=float, default=0.6, help="0-1 (1 = sem suavizacao)")
     ap.add_argument("--render-dir", help="pasta para salvar PNGs")
     ap.add_argument("--export-glb", help="salva animacao em .glb")
     ap.add_argument("--fps", type=int, default=30)
     ap.add_argument("--res", type=int, default=720, help="resolucao do render (quadrado)")
-    ap.add_argument("--cam-dist", type=float, default=2.0)
-    ap.add_argument("--cam-height", type=float, default=1.45)
-    ap.add_argument("--look-height", type=float, default=1.35)
+    ap.add_argument("--focus", choices=["auto", "full", "hands"], default="auto",
+                    help="enquadramento: auto (cabeca ate cintura, com as maos), full (corpo inteiro) ou hands (so as maos)")
+    ap.add_argument("--margin", type=float, default=1.0,
+                    help="multiplicador de zoom (>1 afasta, <1 aproxima)")
     a = ap.parse_args()
 
     src = Path(a.input)
@@ -245,8 +325,16 @@ def main():
     arm = load_model(a.model)
     scene = bpy.context.scene
     scene.render.fps = a.fps
-    setup_camera_and_render(scene, a.res, a.cam_dist, a.cam_height, a.look_height)
+    setup_scene(scene, a.res)
     rig = Rig(arm)
+    esperados = ["LeftArm", "LeftForeArm", "LeftHand", "LeftHandIndex1", "LeftHandThumb1",
+                 "RightArm", "RightForeArm", "RightHand", "RightHandIndex1", "RightHandThumb1"]
+    faltando = [n for n in esperados if rig.bone(n) is None]
+    print(f"Ossos no modelo: {len(rig.names)}")
+    if faltando:
+        print("AVISO: ossos nao encontrados:", faltando)
+        print("Exemplo de nomes no modelo:", rig.names[:12])
+    face_front(rig)
 
     out_dir = Path(a.render_dir) if a.render_dir else None
     if out_dir:
@@ -254,11 +342,14 @@ def main():
 
     prev = None
     for i, f in enumerate(files, start=1):
-        frame = load_frame(f, a.width, a.height, swap_hand_labels=not a.keep_labels)
+        frame = load_frame(f, a.width, a.height, swap_hand_labels=not a.keep_labels,
+                           mirror=a.mirror)
         frame = smooth(prev, frame, a.smooth)
         prev = frame
-        apply_frame(rig, frame)
         scene.frame_set(i)
+        apply_frame(rig, frame)
+        if i == 1:
+            frame_camera(scene, rig, a.focus, a.margin)
         if a.export_glb:
             rig.keyframe(i)
         if out_dir:
