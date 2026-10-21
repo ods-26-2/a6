@@ -36,13 +36,30 @@ uv venv --python 3.11 .venv/blender
 uv pip install --python .venv/blender/bin/python -r req_blender.txt
 ```
 
-### 4. Atualizar as dependências
+### 4. Executar
+
+Cada script deve rodar no Python do seu ambiente. Não é necessário ativar nada:
+
+```bash
+# Converter o FBX do Mixamo para GLB
+.venv/blender/bin/python avatar/fbx_to_glb.py avatar/ybot.fbx avatar/ybot.glb
+
+# Abrir o avatar numa janela
+.venv/generic/bin/python avatar/viewer.py ybot.glb
+
+# Aplicar keypoints e renderizar
+.venv/blender/bin/python avatar/avatar_keypoints.py dataset_maos/keypoints/{keypoints}.json --model avatar/ybot.fbx --render-dir avatar/saida --mirror
+```
+
+Se preferir ativar o ambiente: `source .venv/generic/bin/activate` (e `deactivate` ao terminar).
+
+### 5. Atualizar as dependências
 
 Depois de instalar um pacote novo, regenere o arquivo do ambiente correspondente:
 
 ```bash
-uv pip freeze --python .venv/standard/bin/python > reqs.txt
-uv pip freeze --python .venv/blender/bin/python > req_blender.txt
+uv pip freeze --python .venv/standard/bin/python > requirements-generic.txt
+uv pip freeze --python .venv/blender/bin/python > requirements-blender.txt
 ```
 
 #  Mapeamento Geométrico das Expressões Não-Manuais (ENMs) em LIBRAS
