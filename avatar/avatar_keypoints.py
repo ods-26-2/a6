@@ -26,6 +26,10 @@ from pathlib import Path
 import bpy
 from mathutils import Vector
 
+# Espelhar a pose por padrao? (True = espelha; mude para False para desligar).
+# Da para sobrescrever na linha de comando com --mirror / --no-mirror.
+MIRROR_PADRAO = True
+
 # --------------------------------------------------------------------------
 # Mapeamento landmark MediaPipe -> osso (nomes Mixamo, sem o prefixo "mixamorig:")
 # Cada osso "aponta" do landmark A para o landmark B.
@@ -253,18 +257,30 @@ def frame_camera(scene, rig, focus, margin):
     print(f"Avatar: altura={height:.3f}  camera a {dist:.3f} (foco={focus})")
 
 
-def default_stance(rig):
-    """Bracos em posicao de 'sinalizar' quando nao ha keypoints de corpo."""
-    for side, sx in (("Left", 1), ("Right", -1)):   # avatar: Left em +X
-        rig.aim(f"{side}Arm", Vector((0.25 * sx, 0.0, -1.0)))
-        rig.aim(f"{side}ForeArm", Vector((0.15 * sx, -1.0, 0.6)))
+def rest_arm(rig, side):
+    """Braco relaxado, abaixado ao lado do corpo (pose padrao, sem keypoints)."""
+    sx = 1 if side == "Left" else -1          # avatar: Left em +X
+    rig.aim(f"{side}Arm", Vector((0.12 * sx, 0.0, -1.0)))
+    rig.aim(f"{side}ForeArm", Vector((0.08 * sx, -0.10, -1.0)))
+    rig.aim(f"{side}Hand", Vector((0.05 * sx, -0.05, -1.0)))
+
+
+def raise_arm(rig, side):
+    """Braco em posicao de sinalizar (antebraco a frente). Usado so quando ha keypoints da mao."""
+    sx = 1 if side == "Left" else -1
+    rig.aim(f"{side}Arm", Vector((0.25 * sx, 0.0, -1.0)))
+    rig.aim(f"{side}ForeArm", Vector((0.15 * sx, -1.0, 0.6)))
 
 
 def apply_body(rig, pose):
+    """Posiciona os bracos pelos keypoints de corpo. Retorna os lados que foram posicionados."""
+    done = set()
     for side, (s, e, w) in POSE_ARM.items():
         if all(i in pose for i in (s, e, w)):
             rig.aim(f"{side}Arm", pose[e] - pose[s])
             rig.aim(f"{side}ForeArm", pose[w] - pose[e])
+            done.add(side)
+    return done
 
 
 def apply_hand(rig, side, p):
@@ -286,12 +302,15 @@ def apply_face(rig, face):
 
 def apply_frame(rig, frame):
     rig.reset()
-    if frame["pose"]:
-        apply_body(rig, frame["pose"])
-    else:
-        default_stance(rig)
-    for side, pts in frame["hands"].items():
-        if len(pts) >= 21:
+    # lados cujo braco ja foi posicionado pelos keypoints de corpo
+    body_sides = apply_body(rig, frame["pose"]) if frame["pose"] else set()
+    for side in ("Left", "Right"):
+        pts = frame["hands"].get(side)
+        has_hand = pts is not None and len(pts) >= 21
+        if side not in body_sides:
+            # sem keypoints de corpo: braco sobe so se houver mao; senao fica abaixado
+            (raise_arm if has_hand else rest_arm)(rig, side)
+        if has_hand:
             apply_hand(rig, side, pts)
 
 
@@ -304,8 +323,9 @@ def main():
     ap.add_argument("--height", type=int, default=720, help="altura da imagem original")
     ap.add_argument("--keep-labels", action="store_true",
                     help="NAO inverter Left/Right das maos (use se a imagem original estava espelhada)")
-    ap.add_argument("--mirror", action="store_true",
-                    help="espelha a pose (use se a imagem original era de camera 'selfie'/espelhada)")
+    ap.add_argument("--mirror", action=argparse.BooleanOptionalAction, default=MIRROR_PADRAO,
+                    help="espelha a pose (imagem original de camera 'selfie'); "
+                         f"padrao: {'ligado' if MIRROR_PADRAO else 'desligado'}. Use --no-mirror para desligar")
     ap.add_argument("--smooth", type=float, default=0.6, help="0-1 (1 = sem suavizacao)")
     ap.add_argument("--render-dir", help="pasta para salvar PNGs")
     ap.add_argument("--export-glb", help="salva animacao em .glb")
