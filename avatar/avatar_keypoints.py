@@ -61,8 +61,11 @@ def to_world(kp, w, h, mirror=False):
 _POSE_SWAP = {11: 12, 12: 11, 13: 14, 14: 13, 15: 16, 16: 15}
 
 
-def load_frame(path, w, h, swap_hand_labels, mirror=False):
-    d = json.loads(Path(path).read_text(encoding="utf-8"))
+def load_frame(source, w, h, swap_hand_labels, mirror=False):
+    if isinstance(source, dict):
+        d = source
+    else:
+        d = json.loads(Path(source).read_text(encoding="utf-8-sig"))
     # espelhar inverte a anatomia: a mao esquerda vira direita e vice-versa
     do_swap = swap_hand_labels != mirror
     hands = {}
@@ -338,9 +341,20 @@ def main():
     a = ap.parse_args()
 
     src = Path(a.input)
-    files = sorted(src.glob("*.json")) if src.is_dir() else [src]
-    if not files:
+    if src.is_file():
+        conteudo_json = json.loads(src.read_text(encoding="utf-8-sig"))
+        if isinstance(conteudo_json, list):
+            items = [(f"frame_{idx:04d}", f_dict) for idx, f_dict in enumerate(conteudo_json, start=1)]
+        else:
+            items = [(src.stem, src)]
+    elif src.is_dir():
+        files = sorted(src.glob("*.json"))
+        items = [(f.stem, f) for f in files]
+    else:
         sys.exit("Nenhum JSON encontrado.")
+
+    if not items:
+        sys.exit("Nenhum frame encontrado para animar.")
 
     arm = load_model(a.model)
     scene = bpy.context.scene
@@ -361,8 +375,8 @@ def main():
         out_dir.mkdir(parents=True, exist_ok=True)
 
     prev = None
-    for i, f in enumerate(files, start=1):
-        frame = load_frame(f, a.width, a.height, swap_hand_labels=not a.keep_labels,
+    for i, (name, src_item) in enumerate(items, start=1):
+        frame = load_frame(src_item, a.width, a.height, swap_hand_labels=not a.keep_labels,
                            mirror=a.mirror)
         frame = smooth(prev, frame, a.smooth)
         prev = frame
@@ -373,11 +387,11 @@ def main():
         if a.export_glb:
             rig.keyframe(i)
         if out_dir:
-            scene.render.filepath = str(out_dir / f"{f.stem}.png")
+            scene.render.filepath = str(out_dir / f"{name}.png")
             bpy.ops.render.render(write_still=True)
-        print(f"[{i}/{len(files)}] {f.name}")
+        print(f"[{i}/{len(items)}] {name}")
 
-    scene.frame_start, scene.frame_end = 1, len(files)
+    scene.frame_start, scene.frame_end = 1, len(items)
     if a.export_glb:
         bpy.ops.export_scene.gltf(filepath=a.export_glb, export_format="GLB", export_animations=True)
         print("Animacao salva em", a.export_glb)
