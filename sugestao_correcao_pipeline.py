@@ -1,491 +1,551 @@
 """
 sugestao_correcao_pipeline.py
 ==============================
-Módulo 5: Pipeline de Sugestão e Correção de LIBRAS (Squad A6).
+Módulo de Sugestão de Correção e Gramática de LIBRAS (Squad A6 · Camada 4 · Arquitetura 6c).
 
-Fluxo arquitetural:
-1. 5.2.2 - Savitzky-Golay (scipy.signal.savgol_filter / fallback suave):
-          Suavização temporal dos eixos x, y, z para eliminação de ruídos e tremores.
-2. 5.2.3 - ST-GCN / Extrator Fonológico:
-          Classificação e extração dos parâmetros fonológicos (CM, PA, Orientação, Movimento).
-3. 5.2.4 - Validador Paramétrico:
-          Correções biomecânicas angulares nas articulações (ex: rotação de pulso limitada fisiologicamente).
-4. 5.2.5 - Sintaxe LIBRAS:
-          Reorganização gramatical das glosas para a ordem canônica [TEMPO] + [SUJEITO] + [OBJETO] + [VERBO].
-5. Renderização / Exportação para o avatar 3D (formato nativo compatível com a6/avatar/avatar_keypoints.py).
+Opera EXCLUSIVAMENTE sobre palavras/glosas e metadados gramaticais (sem manipular keypoints 3D):
+1. Artefato LEXICON compartilhado com S6 e I4 (100 glosas oficiais + conjunto fechado de marcadores faciais).
+2. Sentido Libras -> Português (Entrada I4: `ods.i4.sign`):
+   - Avalia `confidence`. Quando baixa ou fora do léxico, oferece as alternativas de `alternatives`
+     para manter a conversa fluindo sem falhar em silêncio.
+3. Sentido Português -> Libras (Saída p/ S6: `ods.s6.synthesis.command` e `ods.s6.synthesis.reply`):
+   - Faz a PRÉ-VALIDAÇÃO local ANTES de enviar para o S6: compara cada palavra contra o LEXICON de 100 palavras,
+     sugerindo e aplicando substituições por sinônimos ou proximidade ortográfica (Levenshtein/SequenceMatcher).
+   - Aplica a gramática própria da LIBRAS: ordem canônica [TEMPO] + [SUJEITO] + [OBJETO] + [VERBO] e
+     extração do conjunto fechado de marcadores faciais (`INTERROGATIVA_QU`, `INTERROGATIVA_SN`, `NEGACAO`, etc.).
+   - Também trata `unknown_signs` vindo na reply de S6 como fallback de segurança.
 """
 
 from __future__ import annotations
 
-import copy
-import math
+import difflib
+import json
+import unicodedata
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 
-try:
-    from scipy.signal import savgol_filter
-    HAS_SCIPY = True
-except ImportError:
-    HAS_SCIPY = False
+def normalize_gloss(text: str) -> str:
+    """Remove acentos, pontuação e converte para maiúsculas: 'Amanhã?' -> 'AMANHA'."""
+    decomposed = unicodedata.normalize("NFD", str(text))
+    stripped = "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
+    cleaned = "".join(c for c in stripped if c.isalnum() or c in ("-", "_"))
+    return cleaned.upper().strip()
 
 
 class LibrasCorrectionPipeline:
-    """Pipeline completo de correção, validação e refinamento biomecânico e sintático de LIBRAS."""
+    """
+    Corretor Léxico, Sintático e de Sugestão de Alternativas em LIBRAS (Camada 4 - A6).
+    """
 
-    GRAMMAR_LEXICON = {
-        # Marcadores temporais
-        "HOJE": "TEMPO",
-        "ONTEM": "TEMPO",
-        "AMANHA": "TEMPO",
-        "AMANHÃ": "TEMPO",
-        "AGORA": "TEMPO",
-        "PASSADO": "TEMPO",
-        "FUTURO": "TEMPO",
-        "ANO-PASSADO": "TEMPO",
-        "SEMANA-PASSADA": "TEMPO",
+    # Conjunto fechado oficial de marcadores gramaticais (definido uma única vez em A6)
+    CLOSED_FACIAL_MARKERS = (
+        "INTERROGATIVA_QU",
+        "INTERROGATIVA_SN",
+        "NEGACAO",
+        "AFIRMACAO",
+        "INTENSIDADE",
+        "NEUTRO",
+    )
 
-        # Sujeitos / Pronomes
-        "EU": "SUJEITO",
-        "VOCE": "SUJEITO",
-        "VOCÊ": "SUJEITO",
-        "ELE": "SUJEITO",
-        "ELA": "SUJEITO",
-        "NOS": "SUJEITO",
-        "NÓS": "SUJEITO",
-        "ELES": "SUJEITO",
-        "ELAS": "SUJEITO",
-        "ALUNO": "SUJEITO",
-        "PROFESSOR": "SUJEITO",
-        "PROFESSORA": "SUJEITO",
-        "HOMEM": "SUJEITO",
-        "MULHER": "SUJEITO",
-        "MENINO": "SUJEITO",
-        "MENINA": "SUJEITO",
+    # Dicionário de sinônimos / palavras próximas em Português -> Glosa oficial do LEXICON de 100 palavras
+    SYNONYM_MAP: Dict[str, str] = {
+        # Pessoas / Sujeitos
+        "ESTUDANTE": "ALUNO",
+        "DISCENTE": "ALUNO",
+        "UNIVERSITARIO": "ALUNO",
+        "COLEGIAL": "ALUNO",
+        "DOCENTE": "PROFESSOR",
+        "MESTRE": "PROFESSOR",
+        "EDUCADOR": "PROFESSOR",
+        "INSTRUTOR": "PROFESSOR",
+        "DOUTOR": "MEDICO",
+        "ENFERMEIRO": "MEDICO",
+        "GAROTO": "CRIANCA",
+        "GAROTA": "CRIANCA",
+        "MENINO": "CRIANCA",
+        "MENINA": "CRIANCA",
+        "BEBE": "CRIANCA",
+        "JOVEM": "CRIANCA",
+        "FILHA": "FILHO",
+        "IRMA": "IRMAO",
+        "COISA": "PROBLEMA",
+        "GENTE": "PESSOA",
+        "INDIVIDUO": "PESSOA",
+        "COLEGA": "AMIGO",
+        "PARCEIRO": "AMIGO",
+        "COMPANHEIRO": "AMIGO",
+        "PAPAI": "PAI",
+        "MAMAE": "MAE",
+        "SENHOR": "HOMEM",
+        "SENHORA": "MULHER",
+        "MOCA": "MULHER",
+        "RAPAZ": "HOMEM",
+        "TU": "VOCE",
+        "VOCES": "VOCE",
+        "AGENTE": "NOS",
 
-        # Objetos / Substantivos
-        "LIVRO": "OBJETO",
-        "CASA": "OBJETO",
-        "ESCOLA": "OBJETO",
-        "AGUA": "OBJETO",
-        "ÁGUA": "OBJETO",
-        "CARRO": "OBJETO",
-        "COMIDA": "OBJETO",
-        "BOLA": "OBJETO",
-        "BANCO": "OBJETO",
-        "CINCO": "OBJETO",
+        # Objetos / Lugares / Substantivos
+        "COLEGIO": "ESCOLA",
+        "AULA": "ESCOLA",
+        "UNIVERSIDADE": "FACULDADE",
+        "CURSO": "FACULDADE",
+        "RESIDENCIA": "CASA",
+        "LAR": "CASA",
+        "MORADIA": "CASA",
+        "APARTAMENTO": "CASA",
+        "CLINICA": "HOSPITAL",
+        "POSTO": "HOSPITAL",
+        "EMPREGO": "TRABALHO",
+        "SERVICO": "TRABALHO",
+        "ESCRITORIO": "TRABALHO",
+        "MUNICIPIO": "CIDADE",
+        "PAIS": "BRASIL",
+        "GRANA": "DINHEIRO",
+        "MOEDA": "DINHEIRO",
+        "VALOR": "DINHEIRO",
+        "PRECO": "DINHEIRO",
+        "PAGAMENTO": "BANCO",
+        "CAIXA": "BANCO",
+        "AGENCIA": "BANCO",
+        "SANITARIO": "BANHEIRO",
+        "TOALETE": "BANHEIRO",
+        "WC": "BANHEIRO",
+        "PRIVADA": "BANHEIRO",
+        "SOM": "BARULHO",
+        "RUIDO": "BARULHO",
+        "GRITO": "BARULHO",
+        "DOCE": "BALA",
+        "BOMBOM": "BALA",
+        "ACUCAR": "BALA",
+        "FRUTA": "MACA",
+        "ALIMENTO": "COMIDA",
+        "REFEICAO": "COMIDA",
+        "ALMOCO": "COMIDA",
+        "JANTAR": "COMIDA",
+        "LANCHE": "PAO",
+        "BEBIDA": "AGUA",
+        "REFRIGERANTE": "SUCO",
+        "TELEFONE": "CELULAR",
+        "SMARTPHONE": "CELULAR",
+        "NOTEBOOK": "COMPUTADOR",
+        "PC": "COMPUTADOR",
+        "LAPTOP": "COMPUTADOR",
+        "AUTOMOVEL": "CARRO",
+        "VEICULO": "CARRO",
+        "TRANSPORTE": "ONIBUS",
+        "APOSTILA": "LIVRO",
+        "TEXTO": "LIVRO",
+        "LAPIS": "CANETA",
+        "PAPEL": "CADERNO",
+        "INJECAO": "VACINA",
+        "REMEDIO": "VACINA",
+        "MEDICAMENTO": "VACINA",
+        "RECEIO": "MEDO",
+        "PAVOR": "MEDO",
+        "ASSUSTADO": "MEDO",
+        "SUSTO": "MEDO",
+        "MAU": "RUIM",
+        "PESSIMO": "RUIM",
+        "HORRIVEL": "RUIM",
+        "FEIO": "RUIM",
+        "OTIMO": "BOM",
+        "EXCELENTE": "BOM",
+        "LEGAL": "BOM",
+        "BEM": "BOM",
+        "LINDO": "BONITO",
+        "BELO": "BONITO",
+        "SIMPLES": "FACIL",
+        "COMPLICADO": "DIFICIL",
+        "DURO": "DIFICIL",
 
-        # Verbos
-        "ESTUDAR": "VERBO",
-        "LER": "VERBO",
-        "IR": "VERBO",
-        "VIR": "VERBO",
-        "COMER": "VERBO",
-        "BEBER": "VERBO",
-        "TER": "VERBO",
-        "QUERER": "VERBO",
-        "GOSTAR": "VERBO",
-        "TRABALHAR": "VERBO",
-        "COMPRAR": "VERBO",
-        "VENDER": "VERBO",
-        "VER": "VERBO",
+        # Verbos / Ações
+        "DESEJAR": "VONTADE",
+        "DESEJO": "VONTADE",
+        "AFIM": "VONTADE",
+        "OCORRER": "ACONTECER",
+        "SUCEDER": "ACONTECER",
+        "HAVER": "ACONTECER",
+        "CURTIR": "APROVEITAR",
+        "DESFRUTAR": "APROVEITAR",
+        "USAR": "APROVEITAR",
+        "COMPREENDER": "ENTENDER",
+        "PERCEBER": "ENTENDER",
+        "CONHECIMENTO": "SABER",
+        "CONHECO": "CONHECER",
+        "LER": "ESTUDAR",
+        "PESQUISAR": "ESTUDAR",
+        "TREINAR": "APRENDER",
+        "EXPLICAR": "ENSINAR",
+        "ORIENTAR": "ENSINAR",
+        "AUXILIAR": "AJUDAR",
+        "SOCORRER": "AJUDAR",
+        "APOIO": "AJUDAR",
+        "ADQUIRIR": "COMPRAR",
+        "PAGAR": "COMPRAR",
+        "OLHAR": "VER",
+        "ENXERGAR": "VER",
+        "ASSISTIR": "VER",
+        "OBSERVAR": "VER",
+        "ALIMENTAR": "COMER",
+        "ALMOCAR": "COMER",
+        "JANTAR": "COMER",
+        "TOMAR": "BEBER",
+        "INGERIR": "BEBER",
+        "DESCANSAR": "DORMIR",
+        "DEITAR": "DORMIR",
+        "SONO": "DORMIR",
+        "CAMINHAR": "IR",
+        "ANDAR": "IR",
+        "VIAJAR": "IR",
+        "PARTIR": "IR",
+        "CHEGAR": "VIR",
+        "VOLTAR": "VIR",
+        "RETORNAR": "VIR",
+        "AMAR": "GOSTAR",
+        "ADORAR": "GOSTAR",
+        "NECESSITAR": "PRECISAR",
+        "CONSEGUIR": "PODER",
     }
 
-    # Índices MediaPipe Pose
-    POSE_LEFT_SHOULDER = 11
-    POSE_RIGHT_SHOULDER = 12
-    POSE_LEFT_ELBOW = 13
-    POSE_RIGHT_ELBOW = 14
-    POSE_LEFT_WRIST = 15
-    POSE_RIGHT_WRIST = 16
+    # Palavras funcionais do Português que são omitidas na glosa de Libras (artigos, preposições, etc.)
+    PORTUGUESE_STOPWORDS = {
+        "O", "A", "OS", "AS", "UM", "UMA", "UNS", "UMAS",
+        "DE", "DO", "DA", "DOS", "DAS", "EM", "NO", "NA", "NOS", "NAS",
+        "PARA", "PRO", "PRA", "COM", "POR", "QUE", "E", "MAS", "OU", "SE",
+        "ESTA", "ESTE", "ISSO", "ERA", "FOI", "SER", "ESTAR", "MUITO", "MAIS"
+    }
 
-    # Índices MediaPipe Hands
-    WRIST = 0
-    INDEX_MCP, INDEX_PIP, INDEX_DIP, INDEX_TIP = 5, 6, 7, 8
-    MIDDLE_MCP, MIDDLE_PIP, MIDDLE_DIP, MIDDLE_TIP = 9, 10, 11, 12
-    RING_MCP, RING_PIP, RING_DIP, RING_TIP = 13, 14, 15, 16
-    PINKY_MCP, PINKY_PIP, PINKY_DIP, PINKY_TIP = 17, 18, 19, 20
+    # Palavras interrogativas e de negação para ativar marcadores faciais
+    QUESTION_QU_WORDS = {"QUAL", "QUEM", "QUANDO", "ONDE", "COMO", "PORQUE", "POR-QUE", "QUANTO"}
+    NEGATION_WORDS = {"NAO", "NUNCA", "NADA", "NINGUEM", "JAMAIS"}
 
     def __init__(
         self,
-        savgol_window: int = 7,
-        savgol_polyorder: int = 2,
-        wrist_twist_max_deg: float = 85.0,
-        confidence_threshold: float = 0.60,
+        lexicon_path: Optional[str | Path] = None,
+        confidence_threshold: float = 0.75,
     ):
-        self.savgol_window = savgol_window if savgol_window % 2 != 0 else savgol_window + 1
-        self.savgol_polyorder = savgol_polyorder
-        self.wrist_twist_max_deg = wrist_twist_max_deg
         self.confidence_threshold = confidence_threshold
+        if lexicon_path is None:
+            lexicon_path = Path(__file__).parent / "lexicon_a6.json"
+        self.lexicon_data = self._load_lexicon_file(Path(lexicon_path))
+        self.lexicon_version: str = self.lexicon_data.get("lexicon_version", "lexicon-a6-1.3")
+        self.markers: List[str] = self.lexicon_data.get("markers", list(self.CLOSED_FACIAL_MARKERS))
+
+        # Mapa {GLOSA: CATEGORIA_GRAMATICAL} para as 100 palavras
+        self.lexicon_signs: Dict[str, str] = {
+            normalize_gloss(item["gloss"]): item.get("category", "OBJETO")
+            for item in self.lexicon_data.get("signs", [])
+        }
+        self.valid_glosses: List[str] = sorted(self.lexicon_signs.keys())
+
+    @staticmethod
+    def _load_lexicon_file(path: Path) -> Dict[str, Any]:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8-sig"))
+        raise FileNotFoundError(f"Artefato LEXICON não encontrado em: {path}")
 
     # =========================================================================
-    # 5.2.2 - FILTRO SAVITZKY-GOLAY (Suavização Temporal)
+    # 1. SUGESTÃO DE PALAVRAS DO LÉXICO (Sinônimos + Proximidade Textual)
     # =========================================================================
-    def apply_savitzky_golay(
-        self, keypoint_sequence: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        n_frames = len(keypoint_sequence)
-        if n_frames < 3:
-            return copy.deepcopy(keypoint_sequence)
+    def suggest_alternatives_for_word(self, word: str, max_suggestions: int = 3) -> List[Dict[str, Any]]:
+        """
+        Dada uma palavra que não está no LEXICON de 100 sinais, retorna uma lista ordenada
+        de sugestões válidas do LEXICON (usando sinônimos diretos e similaridade de caracteres).
+        """
+        norm = normalize_gloss(word)
+        if not norm:
+            return []
 
-        window = min(self.savgol_window, n_frames)
-        if window % 2 == 0:
-            window -= 1
-        poly = min(self.savgol_polyorder, window - 1)
+        # Se já existe no léxico, ela mesma é 100% válida
+        if norm in self.lexicon_signs:
+            return [{"gloss": norm, "reason": "presente_no_lexico", "score": 1.0}]
 
-        smoothed = copy.deepcopy(keypoint_sequence)
+        suggestions: List[Dict[str, Any]] = []
 
-        for hand_key in ("left_hand", "right_hand", "left_hand_global", "right_hand_global"):
-            smoothed = self._smooth_stream(smoothed, hand_key, window=window, poly=poly)
+        # 1. Verifica mapeamento semântico / sinônimos
+        if norm in self.SYNONYM_MAP:
+            target = self.SYNONYM_MAP[norm]
+            if target in self.lexicon_signs:
+                suggestions.append({
+                    "gloss": target,
+                    "reason": f"sinonimo_semantico ('{norm}' -> '{target}')",
+                    "score": 0.95,
+                })
 
-        for body_key in ("body", "pose"):
-            smoothed = self._smooth_stream(smoothed, body_key, window=window, poly=poly)
+        # 2. Verifica radicais / prefixos verbais do Português (ex: ESTUDANDO -> ESTUDAR, ALUNOS -> ALUNO)
+        for candidate in self.valid_glosses:
+            if any(s["gloss"] == candidate for s in suggestions):
+                continue
+            if (norm.startswith(candidate[:4]) and len(candidate) >= 4) or (
+                norm.rstrip("S") == candidate
+            ):
+                ratio = difflib.SequenceMatcher(None, norm, candidate).ratio()
+                suggestions.append({
+                    "gloss": candidate,
+                    "reason": f"variacao_morfologica ('{norm}' ~ '{candidate}')",
+                    "score": round(max(0.80, ratio), 2),
+                })
 
-        smoothed = self._smooth_stream(smoothed, "face", window=window, poly=poly)
-        return smoothed
+        # 3. Similaridade ortográfica (difflib.get_close_matches)
+        close_matches = difflib.get_close_matches(norm, self.valid_glosses, n=max_suggestions, cutoff=0.55)
+        for match in close_matches:
+            if any(s["gloss"] == match for s in suggestions):
+                continue
+            score = round(difflib.SequenceMatcher(None, norm, match).ratio(), 2)
+            suggestions.append({
+                "gloss": match,
+                "reason": "similaridade_ortografica",
+                "score": score,
+            })
 
-    def _smooth_stream(
+        suggestions.sort(key=lambda x: x["score"], reverse=True)
+        return suggestions[:max_suggestions]
+
+    # =========================================================================
+    # 2. PRÉ-VALIDAÇÃO E CORREÇÃO ANTES DE ENVIAR PARA O S6 (CASO B - PREVENTIVO)
+    # =========================================================================
+    def prepare_synthesis_command(
         self,
-        sequence: List[Dict[str, Any]],
-        key: str,
-        window: int,
-        poly: int,
-    ) -> List[Dict[str, Any]]:
-        frames_present = [i for i, f in enumerate(sequence) if f.get(key) is not None and len(f[key]) > 0]
-        if len(frames_present) < window or window <= poly:
-            return sequence
-
-        is_dict_format = isinstance(sequence[frames_present[0]][key][0], dict)
-        actual_points = len(sequence[frames_present[0]][key])
-        coords = np.zeros((len(frames_present), actual_points, 3), dtype=np.float32)
-
-        for idx, f_idx in enumerate(frames_present):
-            pts = sequence[f_idx][key]
-            for p_idx in range(min(actual_points, len(pts))):
-                pt = pts[p_idx]
-                if is_dict_format:
-                    coords[idx, p_idx, 0] = pt.get("x", 0.0)
-                    coords[idx, p_idx, 1] = pt.get("y", 0.0)
-                    coords[idx, p_idx, 2] = pt.get("z", 0.0)
-                else:
-                    coords[idx, p_idx, 0] = pt[0]
-                    coords[idx, p_idx, 1] = pt[1]
-                    coords[idx, p_idx, 2] = pt[2]
-
-        if HAS_SCIPY:
-            for p_idx in range(actual_points):
-                for axis in range(3):
-                    coords[:, p_idx, axis] = savgol_filter(
-                        coords[:, p_idx, axis], window_length=window, polyorder=poly
-                    )
-        else:
-            k = window // 2
-            for p_idx in range(actual_points):
-                for axis in range(3):
-                    orig = coords[:, p_idx, axis].copy()
-                    for idx in range(len(frames_present)):
-                        start = max(0, idx - k)
-                        end = min(len(frames_present), idx + k + 1)
-                        coords[idx, p_idx, axis] = float(np.mean(orig[start:end]))
-
-        for idx, f_idx in enumerate(frames_present):
-            for p_idx in range(min(actual_points, len(sequence[f_idx][key]))):
-                if is_dict_format:
-                    sequence[f_idx][key][p_idx]["x"] = float(round(coords[idx, p_idx, 0], 4))
-                    sequence[f_idx][key][p_idx]["y"] = float(round(coords[idx, p_idx, 1], 4))
-                    sequence[f_idx][key][p_idx]["z"] = float(round(coords[idx, p_idx, 2], 4))
-                else:
-                    sequence[f_idx][key][p_idx][0] = float(round(coords[idx, p_idx, 0], 4))
-                    sequence[f_idx][key][p_idx][1] = float(round(coords[idx, p_idx, 1], 4))
-                    sequence[f_idx][key][p_idx][2] = float(round(coords[idx, p_idx, 2], 4))
-
-        return sequence
-
-    # =========================================================================
-    # 5.2.3 - ST-GCN / EXTRAÇÃO FONOLÓGICA
-    # =========================================================================
-    def extract_phonological_parameters(
-        self, sign_label: str, keypoint_sequence: List[Dict[str, Any]]
+        input_words_or_sentence: List[str] | str,
+        speed_factor: float = 1.0,
+        explicit_marker: Optional[str] = None,
+        auto_apply_top_suggestion: bool = True,
     ) -> Dict[str, Any]:
-        if not keypoint_sequence:
-            return {
-                "sign": sign_label,
-                "configuracao_mao": "DESCONHECIDA",
-                "ponto_articulacao": "ESPACO_NEUTRO",
-                "orientacao_palma": "NEUTRA",
-                "movimento": "ESTATICO",
-            }
+        """
+        Compara todas as palavras contra o LEXICON de 100 palavras ANTES de enviar ao S6:
+        - Filtra stopwords do português;
+        - Identifica marcadores faciais gramaticais (Pergunta, Negação, Intensidade);
+        - Sugere e aplica correções para palavras fora do léxico;
+        - Reordena as glosas na gramática de LIBRAS: [TEMPO] + [SUJEITO] + [OBJETO] + [VERBO];
+        - Devolve o payload pronto de `ods.s6.synthesis.command` + relatório de sugestões.
+        """
+        if isinstance(input_words_or_sentence, str):
+            raw_text = input_words_or_sentence
+            tokens = raw_text.replace("?", " ? ").replace("!", " ! ").split()
+        else:
+            raw_text = " ".join(input_words_or_sentence)
+            tokens = list(input_words_or_sentence)
 
-        mid_idx = len(keypoint_sequence) // 2
-        mid_frame = keypoint_sequence[mid_idx]
+        has_question_mark = "?" in raw_text
+        has_exclamation = "!" in raw_text
+        detected_qu = False
+        detected_negation = False
 
-        hand = mid_frame.get("right_hand") or mid_frame.get("left_hand")
-        if not hand and "right_hand_global" in mid_frame:
-            hand = mid_frame.get("right_hand_global") or mid_frame.get("left_hand_global")
+        validated_glosses: List[str] = []
+        word_corrections: List[Dict[str, Any]] = []
+        unresolved_words: List[str] = []
 
-        return {
-            "sign": sign_label,
-            "configuracao_mao": self._estimate_handshape(hand),
-            "ponto_articulacao": self._estimate_articulation_point(mid_frame),
-            "orientacao_palma": self._estimate_palm_orientation(hand),
-            "movimento": self._estimate_movement_dynamics(keypoint_sequence),
+        for raw_token in tokens:
+            if raw_token in ("?", "!"):
+                continue
+            norm = normalize_gloss(raw_token)
+            if not norm:
+                continue
+
+            if norm in self.QUESTION_QU_WORDS:
+                detected_qu = True
+                continue
+            if norm in self.NEGATION_WORDS:
+                detected_negation = True
+                if norm not in self.lexicon_signs:
+                    continue
+            if norm in self.PORTUGUESE_STOPWORDS and norm not in self.lexicon_signs:
+                continue
+
+            # Palavra já existe diretamente no LEXICON de 100 sinais
+            if norm in self.lexicon_signs:
+                validated_glosses.append(norm)
+            else:
+                # Palavra fora do léxico -> Aciona motor de Sugestão de Correção ANTES de enviar ao S6
+                alternatives = self.suggest_alternatives_for_word(norm)
+                chosen = alternatives[0]["gloss"] if (alternatives and auto_apply_top_suggestion) else None
+
+                word_corrections.append({
+                    "original_word": raw_token,
+                    "normalized": norm,
+                    "status": "SUBSTITUIDA_POR_SUGESTAO" if chosen else "SEM_CORRESPONDENCIA_DIRETA",
+                    "applied_gloss": chosen,
+                    "suggestions": alternatives,
+                })
+
+                if chosen:
+                    validated_glosses.append(chosen)
+                else:
+                    unresolved_words.append(norm)
+
+        # Reordenação Gramatical da LIBRAS: [TEMPO] + [SUJEITO] + [OBJETO] + [VERBO]
+        ordered_glosses, was_reordered = self.reorganize_syntax(validated_glosses)
+
+        # Determina o marcador facial do conjunto fechado
+        marker_to_use = explicit_marker
+        if not marker_to_use:
+            if detected_qu:
+                marker_to_use = "INTERROGATIVA_QU"
+            elif has_question_mark:
+                marker_to_use = "INTERROGATIVA_SN"
+            elif detected_negation:
+                marker_to_use = "NEGACAO"
+            elif has_exclamation:
+                marker_to_use = "INTENSIDADE"
+
+        markers_payload = []
+        if marker_to_use and marker_to_use != "NEUTRO" and ordered_glosses:
+            markers_payload.append({
+                "marker": marker_to_use,
+                "from_gloss_index": 0,
+                "to_gloss_index": len(ordered_glosses) - 1,
+            })
+
+        command_payload = {
+            "glosses": ordered_glosses,
+            "speed_factor": float(speed_factor),
+            "markers": markers_payload,
+            "lexicon_version": self.lexicon_version,
         }
 
-    def _estimate_handshape(self, hand_points: Optional[List[Any]]) -> str:
-        if not hand_points or len(hand_points) < 21:
-            return "NAO_DETECTADA"
-
-        pts = []
-        for p in hand_points:
-            if isinstance(p, dict):
-                pts.append([p.get("x", 0.0), p.get("y", 0.0), p.get("z", 0.0)])
-            else:
-                pts.append([p[0], p[1], p[2]])
-        pts = np.array(pts)
-
-        wrist = pts[self.WRIST]
-        dedos_estendidos = []
-        for tip_idx, mcp_idx in [
-            (self.INDEX_TIP, self.INDEX_MCP),
-            (self.MIDDLE_TIP, self.MIDDLE_MCP),
-            (self.RING_TIP, self.RING_MCP),
-            (self.PINKY_TIP, self.PINKY_MCP),
-        ]:
-            d_tip = np.linalg.norm(pts[tip_idx] - wrist)
-            d_mcp = np.linalg.norm(pts[mcp_idx] - wrist)
-            dedos_estendidos.append(d_tip > d_mcp * 1.15)
-
-        idx, mid, ring, pnk = dedos_estendidos
-        if all(dedos_estendidos):
-            return "PALMA_ABERTA_B"
-        if not any(dedos_estendidos):
-            return "PUNHO_FECHADO_S_OU_A"
-        if idx and not mid and not ring and not pnk:
-            return "INDICADOR_1_OU_D"
-        if idx and mid and not ring and not pnk:
-            return "V_OU_DOIS"
-        if idx and mid and ring and not pnk:
-            return "TRES_OU_W"
-        if not idx and not mid and not ring and pnk:
-            return "I_OU_MINDINHO"
-        if idx and not mid and not ring and pnk:
-            return "ILY_OU_Y"
-        return "CONFIGURACAO_COMPLEXA"
-
-    def _estimate_articulation_point(self, frame: Dict[str, Any]) -> str:
-        pose = frame.get("body") or frame.get("pose")
-        hand = frame.get("right_hand") or frame.get("left_hand") or frame.get("right_hand_global")
-        if not pose or not hand or len(pose) < 17 or len(hand) < 1:
-            return "ESPACO_NEUTRO"
-
-        hand_y = hand[0]["y"] if isinstance(hand[0], dict) else hand[0][1]
-        nose_y = pose[0]["y"] if isinstance(pose[0], dict) else pose[0][1]
-        shoulder_y = pose[11]["y"] if isinstance(pose[11], dict) else pose[11][1]
-
-        if hand_y < nose_y + 0.05:
-            return "CABECA_ROSTO"
-        elif hand_y < shoulder_y + 0.15:
-            return "PEITO_TRONCO"
-        return "ESPACO_NEUTRO"
-
-    def _estimate_palm_orientation(self, hand: Optional[List[Any]]) -> str:
-        if not hand or len(hand) < 21:
-            return "NEUTRA"
-
-        pts = []
-        for p in hand:
-            if isinstance(p, dict):
-                pts.append([p.get("x", 0.0), p.get("y", 0.0), p.get("z", 0.0)])
-            else:
-                pts.append([p[0], p[1], p[2]])
-        pts = np.array(pts)
-
-        v_wrist_middle = pts[self.MIDDLE_MCP] - pts[self.WRIST]
-        v_wrist_pinky = pts[self.PINKY_MCP] - pts[self.INDEX_MCP]
-        normal = np.cross(v_wrist_middle[:3], v_wrist_pinky[:3])
-        norm_len = np.linalg.norm(normal)
-        if norm_len > 1e-6:
-            normal /= norm_len
-
-        if normal[2] > 0.5:
-            return "PARA_FRENTE"
-        elif normal[2] < -0.5:
-            return "PARA_O_CORPO"
-        elif normal[0] > 0.5:
-            return "PARA_DIREITA"
-        elif normal[0] < -0.5:
-            return "PARA_ESQUERDA"
-        return "NEUTRA"
-
-    def _estimate_movement_dynamics(self, sequence: List[Dict[str, Any]]) -> str:
-        if len(sequence) < 2:
-            return "ESTATICO"
-
-        traj = []
-        for f in sequence:
-            h = f.get("right_hand") or f.get("left_hand") or f.get("right_hand_global")
-            if h and len(h) > 0:
-                y = h[0]["y"] if isinstance(h[0], dict) else h[0][1]
-                x = h[0]["x"] if isinstance(h[0], dict) else h[0][0]
-                traj.append((x, y))
-
-        if len(traj) < 2:
-            return "ESTATICO"
-
-        total_disp = sum(
-            math.hypot(traj[i][0] - traj[i - 1][0], traj[i][1] - traj[i - 1][1])
-            for i in range(1, len(traj))
-        )
-        if total_disp < 0.05:
-            return "ESTATICO"
-
-        dy = traj[-1][1] - traj[0][1]
-        dx = traj[-1][0] - traj[0][0]
-        if abs(dy) > abs(dx) * 1.5:
-            return "DESCENDENTE" if dy > 0 else "ASCENDENTE"
-        elif abs(dx) > abs(dy) * 1.5:
-            return "HORIZONTAL"
-        return "CIRCULAR_OU_DIAGONAL"
-
-    # =========================================================================
-    # 5.2.4 - VALIDADOR PARAMÉTRICO (Biomecânica)
-    # =========================================================================
-    def validate_and_correct_biomechanics(
-        self, keypoint_sequence: List[Dict[str, Any]]
-    ) -> Tuple[List[Dict[str, Any]], List[str]]:
-        corrections_applied = []
-        corrected_seq = copy.deepcopy(keypoint_sequence)
-
-        for f_idx, frame in enumerate(corrected_seq):
-            for side, hand_key in [("Left", "left_hand"), ("Right", "right_hand")]:
-                hand = frame.get(hand_key)
-                if not hand or len(hand) < 21:
-                    continue
-
-                idx_pt = hand[self.INDEX_MCP]
-                pnk_pt = hand[self.PINKY_MCP]
-                if isinstance(idx_pt, dict):
-                    v_palm = np.array([pnk_pt["x"] - idx_pt["x"], pnk_pt["y"] - idx_pt["y"], pnk_pt["z"] - idx_pt["z"]])
-                else:
-                    v_palm = np.array([pnk_pt[0] - idx_pt[0], pnk_pt[1] - idx_pt[1], pnk_pt[2] - idx_pt[2]])
-
-                palm_norm = np.linalg.norm(v_palm[:2])
-                if palm_norm > 1e-6:
-                    angle_deg = abs(math.degrees(math.atan2(v_palm[1], v_palm[0])))
-                    if angle_deg > self.wrist_twist_max_deg:
-                        msg = f"Frame {f_idx}: Limite articular no pulso ({side}) excedido ({angle_deg:.1f}°). Ajustado para {self.wrist_twist_max_deg}°"
-                        if msg not in corrections_applied:
-                            corrections_applied.append(msg)
-                        factor = self.wrist_twist_max_deg / angle_deg
-                        for p in hand:
-                            if isinstance(p, dict):
-                                p["z"] *= factor
-                            else:
-                                p[2] *= factor
-
-        return corrected_seq, corrections_applied
-
-    # =========================================================================
-    # 5.2.5 - SINTAXE LIBRAS ([TEMPO] + [SUJEITO] + [OBJETO] + [VERBO])
-    # =========================================================================
-    def reorganize_syntax(self, glosses: List[str]) -> Tuple[List[str], bool]:
-        if not glosses or len(glosses) <= 1:
-            return glosses, False
-
-        tempo_tokens: List[str] = []
-        sujeito_tokens: List[str] = []
-        objeto_tokens: List[str] = []
-        verbo_tokens: List[str] = []
-        outros_tokens: List[str] = []
-
-        for g in glosses:
-            g_clean = g.strip().upper()
-            role = self.GRAMMAR_LEXICON.get(g_clean)
-            if role == "TEMPO":
-                tempo_tokens.append(g_clean)
-            elif role == "SUJEITO":
-                sujeito_tokens.append(g_clean)
-            elif role == "OBJETO":
-                objeto_tokens.append(g_clean)
-            elif role == "VERBO":
-                verbo_tokens.append(g_clean)
-            else:
-                outros_tokens.append(g_clean)
-
-        reordered = tempo_tokens + sujeito_tokens + objeto_tokens + verbo_tokens + outros_tokens
-        was_reordered = [g.upper() for g in glosses] != reordered
-        return reordered, was_reordered
-
-    # =========================================================================
-    # EXPORTAÇÃO PARA O AVATAR 3D (a6/avatar/avatar_keypoints.py)
-    # =========================================================================
-    def export_for_avatar(
-        self,
-        keypoint_sequence: List[Dict[str, Any]],
-        image_size: Tuple[int, int] = (1280, 720),
-    ) -> List[Dict[str, Any]]:
-        avatar_frames = []
-        for f in keypoint_sequence:
-            frame_dict: Dict[str, Any] = {"maos": [], "corpo": []}
-
-            body = f.get("body") or f.get("pose")
-            if body:
-                corpo_list = []
-                for idx, pt in enumerate(body):
-                    if isinstance(pt, dict):
-                        corpo_list.append({"id": idx, "x": pt.get("x", 0.0), "y": pt.get("y", 0.0), "z": pt.get("z", 0.0)})
-                    elif len(pt) >= 3:
-                        corpo_list.append({"id": idx, "x": pt[0], "y": pt[1], "z": pt[2]})
-                frame_dict["corpo"] = corpo_list
-
-            for side_label, key in [("Right", "right_hand"), ("Left", "left_hand"),
-                                    ("Right", "right_hand_global"), ("Left", "left_hand_global")]:
-                pts = f.get(key)
-                if pts and len(pts) >= 21:
-                    if any(m["lado"] == side_label for m in frame_dict["maos"]):
-                        continue
-                    kp_list = []
-                    for idx, pt in enumerate(pts):
-                        if isinstance(pt, dict):
-                            kp_list.append({"id": idx, "x": pt.get("x", 0.0), "y": pt.get("y", 0.0), "z": pt.get("z", 0.0)})
-                        elif len(pt) >= 3:
-                            kp_list.append({"id": idx, "x": pt[0], "y": pt[1], "z": pt[2]})
-                    frame_dict["maos"].append({"lado": side_label, "keypoints": kp_list})
-
-            avatar_frames.append(frame_dict)
-        return avatar_frames
-
-    # =========================================================================
-    # PROCESSAMENTO COMPLETO DA JANELA
-    # =========================================================================
-    def process_sign_window(
-        self,
-        sign_label: str,
-        confidence: float,
-        keypoints: List[Dict[str, Any]],
-        context_glosses: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
-        smoothed_keypoints = self.apply_savitzky_golay(keypoints)
-        phonology = self.extract_phonological_parameters(sign_label, smoothed_keypoints)
-        validated_keypoints, biomechanical_corrections = self.validate_and_correct_biomechanics(
-            smoothed_keypoints
-        )
-
-        all_glosses = (context_glosses or []) + [sign_label]
-        ordered_glosses, was_reordered = self.reorganize_syntax(all_glosses)
-        avatar_payload = self.export_for_avatar(validated_keypoints)
-
         return {
-            "sign": sign_label,
-            "confidence": confidence,
-            "phonology": phonology,
-            "biomechanical_corrections": biomechanical_corrections,
-            "syntactic_correction": {
-                "original": all_glosses,
-                "reordered": ordered_glosses,
+            "input": input_words_or_sentence,
+            "pre_validation": {
+                "all_in_lexicon_originally": len(word_corrections) == 0,
+                "word_corrections": word_corrections,
+                "unresolved_words": unresolved_words,
+            },
+            "grammar": {
+                "before_syntax_order": validated_glosses,
+                "after_syntax_order": ordered_glosses,
                 "was_reordered": was_reordered,
                 "rule": "[TEMPO] + [SUJEITO] + [OBJETO] + [VERBO]",
+                "facial_marker_applied": marker_to_use or "NEUTRO",
             },
-            "corrected_keypoints": validated_keypoints,
-            "avatar_frames": avatar_payload,
+            "s6_command_payload": command_payload,
         }
+
+    # =========================================================================
+    # 3. TRATAMENTO DE `ods.i4.sign` (CASO A - LIBRAS -> PORTUGUÊS)
+    # =========================================================================
+    def evaluate_incoming_i4_sign(
+        self,
+        payload: Dict[str, Any],
+        session_history: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Analisa o evento `ods.i4.sign` publicado pelo I4:
+        - Verifica se `confidence` é menor que o limiar (ex: 0.75) ou se o sinal não está no léxico.
+        - Extrai as alternativas de `alternatives` do payload de I4 e também complementa com o LEXICON se necessário.
+        - Constrói a frase acumulada com a ordem sintática para exibição ao usuário.
+        """
+        raw_sign = payload.get("sign") or payload.get("sinal", "DESCONHECIDO")
+        sign_norm = normalize_gloss(raw_sign)
+        confidence = float(payload.get("confidence") or payload.get("confianca", 0.0))
+        i4_alternatives = payload.get("alternatives", [])
+
+        in_lexicon = sign_norm in self.lexicon_signs
+        low_confidence = confidence < self.confidence_threshold
+        needs_suggestion = low_confidence or (not in_lexicon)
+
+        suggestions: List[Dict[str, Any]] = []
+        # 1. Prioriza as alternativas enviadas pelo classificador de I4 no campo `alternatives`
+        for alt in i4_alternatives:
+            alt_sign = normalize_gloss(alt.get("sign", ""))
+            alt_conf = float(alt.get("confidence", 0.0))
+            if alt_sign:
+                suggestions.append({
+                    "gloss": alt_sign,
+                    "confidence": alt_conf,
+                    "in_lexicon": alt_sign in self.lexicon_signs,
+                    "source": "i4_alternatives",
+                })
+
+        # 2. Se o sinal não estiver no léxico, busca no LEXICON local de 100 palavras
+        if not in_lexicon:
+            for lex_sug in self.suggest_alternatives_for_word(sign_norm):
+                if not any(s["gloss"] == lex_sug["gloss"] for s in suggestions):
+                    suggestions.append({
+                        "gloss": lex_sug["gloss"],
+                        "confidence": lex_sug["score"],
+                        "in_lexicon": True,
+                        "source": f"a6_lexicon ({lex_sug['reason']})",
+                    })
+
+        history = list(session_history or []) + [sign_norm]
+        reordered_sentence, was_reordered = self.reorganize_syntax(history)
+
+        if not in_lexicon:
+            status_msg = f"Sinal '{sign_norm}' fora do LEXICON. Sugerindo alternativas."
+        elif low_confidence:
+            status_msg = (
+                f"Baixa confiança ({confidence:.2f} < {self.confidence_threshold:.2f}) para '{sign_norm}'. "
+                f"Oferecendo alternativas de I4."
+            )
+        else:
+            status_msg = f"Sinal '{sign_norm}' reconhecido com alta confiança ({confidence:.2f})."
+
+        return {
+            "recognized_sign": sign_norm,
+            "confidence": confidence,
+            "in_lexicon": in_lexicon,
+            "needs_correction_suggestion": needs_suggestion,
+            "status_message": status_msg,
+            "suggested_alternatives": suggestions,
+            "sentence_context": {
+                "accumulated_glosses": history,
+                "grammatical_order": reordered_sentence,
+                "was_reordered": was_reordered,
+            },
+        }
+
+    # =========================================================================
+    # 4. TRATAMENTO DE `ods.s6.synthesis.reply` (FALLBACK DE `unknown_signs`)
+    # =========================================================================
+    def evaluate_s6_synthesis_reply(self, reply_payload: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Analisa a reply `ods.s6.synthesis.reply` vinda de S6:
+        - Se `unknown_signs` vier preenchido, oferece imediatamente alternativas do LEXICON de 100 palavras.
+        """
+        unknown_signs = reply_payload.get("unknown_signs") or []
+        suggestions_by_unknown: Dict[str, List[Dict[str, Any]]] = {}
+
+        for unk in unknown_signs:
+            suggestions_by_unknown[unk] = self.suggest_alternatives_for_word(unk)
+
+        return {
+            "status": reply_payload.get("status", "OK"),
+            "trajectory_ref": reply_payload.get("trajectory_ref"),
+            "duration_ms": reply_payload.get("duration_ms"),
+            "facial_markers": reply_payload.get("facial_markers", []),
+            "unknown_signs": unknown_signs,
+            "has_unknown_signs": len(unknown_signs) > 0,
+            "suggestions_for_unknown_signs": suggestions_by_unknown,
+        }
+
+    # =========================================================================
+    # 5. GRAMÁTICA LIBRAS: ORDENAÇÃO [TEMPO] + [SUJEITO] + [OBJETO] + [VERBO]
+    # =========================================================================
+    def reorganize_syntax(self, glosses: List[str]) -> Tuple[List[str], bool]:
+        """Reordena lista de glosas para [TEMPO] + [SUJEITO] + [OBJETO] + [VERBO]."""
+        if not glosses or len(glosses) <= 1:
+            return [normalize_gloss(g) for g in glosses], False
+
+        tempo: List[str] = []
+        sujeito: List[str] = []
+        objeto: List[str] = []
+        verbo: List[str] = []
+        outros: List[str] = []
+
+        normalized_input = [normalize_gloss(g) for g in glosses]
+        for g in normalized_input:
+            role = self.lexicon_signs.get(g)
+            if role == "TEMPO":
+                tempo.append(g)
+            elif role == "SUJEITO":
+                sujeito.append(g)
+            elif role == "OBJETO":
+                objeto.append(g)
+            elif role == "VERBO":
+                verbo.append(g)
+            else:
+                outros.append(g)
+
+        reordered = tempo + sujeito + objeto + verbo + outros
+        return reordered, (normalized_input != reordered)

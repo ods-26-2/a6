@@ -1,20 +1,17 @@
 """
 kafka_integration.py
 ====================
-Integração completa do Módulo 5 ("Sugestão de Correção") com o barramento Kafka (Squad A6).
+Integração Kafka do Squad A6 (Camada 4 · Libras · Arquitetura 6c e Guia TRA-1).
 
-Requisitos atendidos:
-1. Conexão via confluent-kafka com bootstrap server dinâmico via KAFKA_BOOTSTRAP_SERVERS
-   (fallback: 34.66.235.91:9093).
-2. Group ID configurado para 'sugestao-correcao-libras'.
-3. Consumo sem polling apertado (poll(1.0)), protegendo limites e créditos GCP.
-4. Validação estrita do envelope ODS (message_type, schema, version, producer, published_at, payload).
-5. Suporte aos tópicos de entrada produzidos pelo time i4:
-   - 'ods.i4.keypoints' (um evento por quadro com 'body', 'left_hand', 'right_hand', 'face')
-   - 'ods.i4.sign' (evento de sinal reconhecido com rótulo e confiança)
-6. Aplicação do pipeline de correção (LibrasCorrectionPipeline) e publicação das correções
-   no tópico 'ods.gesto.reconhecido' (ou 'ods.fala.transcricao_produzida' configurável).
-7. Geração de JSON estruturado pronto para consumo pelo libras_avatar.py / A6.
+Inclui o AGREGADOR DE FRASES E CONTEXTO EM TEMPO REAL (`SentenceContextAggregator`):
+- Recebe sinais individuais de I4 (`ods.i4.sign`) e marcadores (`ods.i4.facial_marker`).
+- Decide automaticamente se o novo sinal pertence ao MESMO CONTEXTO (mesma frase)
+  ou se inicia um NOVO CONTEXTO (nova frase), com base em:
+    1. Gap temporal entre `end_at` do sinal anterior e `start_at` do novo sinal (> pause_threshold_sec);
+    2. Timeout de inatividade em tempo real no loop do consumidor (fecha a frase quando o usuário para de sinalizar);
+    3. Quebra gramatical de Libras (ex: chegada de novo marcador de [TEMPO] quando a frase já possui [VERBO]);
+    4. Troca de `signer_id`.
+- Salva todas as mensagens e frases fechadas na pasta `a6/mensagens_recebidas_kafka/`.
 """
 
 from __future__ import annotations
@@ -23,10 +20,10 @@ import json
 import logging
 import os
 import signal
-import sys
+import time
 import uuid
-from collections import defaultdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -38,278 +35,598 @@ except ImportError:
     KafkaError = None
     Producer = None
 
-from sugestao_correcao_pipeline import LibrasCorrectionPipeline
+from sugestao_correcao_pipeline import LibrasCorrectionPipeline, normalize_gloss
 
-# Configuração de logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-log = logging.getLogger("a6.modulo5.sugestao_correcao")
+log = logging.getLogger("a6.libras.kafka")
 
-# Variáveis de ambiente e padrões de arquitetura (TRA-1 / B2)
 DEFAULT_BOOTSTRAP = "34.66.235.91:9093"
-DEFAULT_GROUP_ID = "sugestao-correcao-libras"
-PRODUCER_NAME = "modulo5-sugestao-correcao"
+DEFAULT_GROUP_ID = "A6-libras-correcao"
+PRODUCER_ID = "A6"
 SCHEMA_VERSION = "1.0"
 
-# Tópicos
-TOPIC_INPUT_SIGN = os.environ.get("KAFKA_TOPIC_SIGN", "ods.i4.sign")
-TOPIC_INPUT_KEYPOINTS = os.environ.get("KAFKA_TOPIC_KEYPOINTS", "ods.i4.keypoints")
-TOPIC_OUTPUT_GESTURE = os.environ.get("KAFKA_TOPIC_OUTPUT", "ods.gesto.reconhecido")
+TOPIC_I4_SIGN = "ods.i4.sign"
+TOPIC_I4_FACIAL_MARKER = "ods.i4.facial_marker"
+TOPIC_I4_CAPTURE_CMD = "ods.i4.lexicon_capture.command"
+TOPIC_I4_CAPTURE_RPL = "ods.i4.lexicon_capture.reply"
+TOPIC_S6_SYNTHESIS_CMD = "ods.s6.synthesis.command"
+TOPIC_S6_SYNTHESIS_RPL = "ods.s6.synthesis.reply"
 
 
 def get_bootstrap_servers() -> str:
-    """Obtém o bootstrap broker via variável de ambiente com fallback para a nuvem."""
-    return os.environ.get("KAFKA_BOOTSTRAP_SERVERS") or os.environ.get("ODS_KAFKA_BOOTSTRAP", DEFAULT_BOOTSTRAP)
+    return (
+        os.environ.get("KAFKA_BOOTSTRAP_SERVERS")
+        or os.environ.get("ODS_KAFKA_BOOTSTRAP")
+        or DEFAULT_BOOTSTRAP
+    )
 
 
 def utc_iso(dt: Optional[datetime] = None) -> str:
-    """Formata timestamp UTC ISO 8601 com milissegundos."""
     dt = (dt or datetime.now(timezone.utc)).astimezone(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
+def parse_iso_timestamp(iso_str: Optional[str]) -> Optional[float]:
+    """Converte string ISO 8601 ('2026-11-02T14:05:11.100Z') para epoch seconds."""
+    if not iso_str or not isinstance(iso_str, str):
+        return None
+    try:
+        cleaned = iso_str.replace("Z", "+00:00")
+        return datetime.fromisoformat(cleaned).timestamp()
+    except ValueError:
+        return None
+
+
 def validate_ods_envelope(msg: Any) -> Tuple[bool, Optional[str]]:
-    """Valida a integridade do envelope ODS TRA-1."""
     if not isinstance(msg, dict):
-        return False, "Mensagem não é um dicionário JSON válido"
+        return False, "mensagem não é um objeto JSON"
 
-    fixed_fields = ("message_type", "message_id", "schema", "schema_version", "producer", "payload")
-    for f in fixed_fields:
-        if f not in msg:
-            return False, f"Campo obrigatório ausente: '{f}'"
+    required_base = ("message_id", "message_type", "schema", "schema_version", "producer", "payload")
+    for field in required_base:
+        if field not in msg:
+            return False, f"campo obrigatório ausente: {field}"
 
-    version = str(msg.get("schema_version", ""))
-    if not version.startswith("1."):
-        return False, f"Versão de schema não suportada: '{version}'"
+    if "occurred_at" not in msg and "published_at" not in msg:
+        return False, "campo de timestamp ausente (esperado 'occurred_at' ou 'published_at')"
+
+    if not str(msg["schema_version"]).startswith("1."):
+        return False, f"versão não suportada: {msg['schema_version']}"
 
     if not isinstance(msg["payload"], dict):
-        return False, "Campo 'payload' deve ser um objeto JSON"
+        return False, "payload não é um objeto"
 
     return True, None
 
 
 def build_ods_envelope(
+    *,
+    message_type: str,
     schema: str,
     payload: Dict[str, Any],
+    producer: str = PRODUCER_ID,
+    target: Optional[str] = None,
     session_id: Optional[str] = None,
     correlation_id: Optional[str] = None,
-    producer: str = PRODUCER_NAME,
 ) -> Dict[str, Any]:
-    """Constrói o envelope padronizado ODS TRA-1 para envio de eventos no barramento."""
-    envelope = {
+    now = utc_iso()
+    env: Dict[str, Any] = {
         "message_id": str(uuid.uuid4()),
-        "message_type": "event",
+        "message_type": message_type,
         "schema": schema,
         "schema_version": SCHEMA_VERSION,
         "producer": producer,
-        "published_at": utc_iso(),
+        "published_at": now,
+        "occurred_at": now,
         "payload": payload,
     }
+    if target:
+        env["target"] = target
     if session_id:
-        envelope["session_id"] = session_id
+        env["session_id"] = session_id
     if correlation_id:
-        envelope["correlation_id"] = correlation_id
-    return envelope
+        env["correlation_id"] = correlation_id
+    return env
 
 
-class LibrasCorrectionKafkaWorker:
+# =============================================================================
+# AGREGADOR DE FRASES E CONTEXTO EM TEMPO REAL
+# =============================================================================
+class SentenceContextAggregator:
     """
-    Trabalhador de integração Kafka para o Módulo 5 (A6):
-    - Assina os tópicos de sinais e keypoints do I4.
-    - Agrupa os frames da sessão por sinal.
-    - Executa o pipeline de correção (LibrasCorrectionPipeline).
-    - Publica as sugestões no tópico de saída.
+    Agrega sinais isolados recebidos em tempo real de I4 em frases coerentes (contextos)
+    e detecta quando uma frase terminou ou quando um novo contexto começou.
     """
 
     def __init__(
         self,
+        pipeline: LibrasCorrectionPipeline,
+        pause_threshold_sec: float = 3.0,
+        realtime_idle_timeout_sec: float = 3.5,
+    ):
+        """
+        :param pause_threshold_sec: Se `start_at` do novo sinal menos `end_at` do anterior
+               for maior que esse valor (em segundos), fecha a frase anterior e abre novo contexto.
+        :param realtime_idle_timeout_sec: Se não chegar nenhum sinal novo por esse tempo
+               no relógio real, fecha a frase pendente automaticamente.
+        """
+        self.pipeline = pipeline
+        self.pause_threshold_sec = pause_threshold_sec
+        self.realtime_idle_timeout_sec = realtime_idle_timeout_sec
+
+        # Estado do contexto aberto por session_id
+        self.active_contexts: Dict[str, Dict[str, Any]] = {}
+        self.closed_sentences: List[Dict[str, Any]] = []
+        self._context_counter = 0
+
+    def _new_context(self, session_id: str, signer_id: Optional[str]) -> Dict[str, Any]:
+        self._context_counter += 1
+        return {
+            "context_id": f"frase-{self._context_counter:03d}",
+            "session_id": session_id,
+            "signer_id": signer_id,
+            "glosses": [],
+            "categories": [],
+            "signs_detail": [],
+            "facial_markers": [],
+            "started_at_iso": None,
+            "last_end_at_iso": None,
+            "last_end_epoch": None,
+            "last_wallclock_time": time.time(),
+        }
+
+    def check_if_new_context_needed(
+        self,
+        ctx: Dict[str, Any],
+        new_gloss: str,
+        new_category: str,
+        start_epoch: Optional[float],
+        signer_id: Optional[str],
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Verifica se o novo sinal recebido pertence ao contexto/frase atual
+        ou se deve fechar a frase anterior e iniciar uma nova.
+        Retorna (deve_abrir_novo_contexto, motivo).
+        """
+        if not ctx["glosses"]:
+            return False, None
+
+        # Regra 1: Mudou o sinalizador (signer_id)
+        if signer_id and ctx["signer_id"] and signer_id != ctx["signer_id"]:
+            return True, f"Mudança de sinalizador ({ctx['signer_id']} -> {signer_id})"
+
+        # Regra 2: Pausa nos timestamps do evento (`start_at` atual - `end_at` anterior)
+        if start_epoch is not None and ctx["last_end_epoch"] is not None:
+            gap_sec = start_epoch - ctx["last_end_epoch"]
+            if gap_sec >= self.pause_threshold_sec:
+                return True, f"Pausa longa entre sinais ({gap_sec:.2f}s >= {self.pause_threshold_sec:.1f}s)"
+
+        # Regra 3: Pausa no relógio de parede (caso timestamps dos eventos sejam omitidos)
+        wall_gap = time.time() - ctx["last_wallclock_time"]
+        if wall_gap >= self.realtime_idle_timeout_sec and start_epoch is None:
+            return True, f"Inatividade em tempo real ({wall_gap:.2f}s)"
+
+        # Regra 4: Quebra Gramatical da Libras
+        # Se a frase atual JÁ possui um marcador de TEMPO (ex: 'ONTEM') E já possui um VERBO,
+        # e chega UM OUTRO marcador de TEMPO (ex: 'AMANHA'), sabemos que é uma nova oração!
+        if new_category == "TEMPO" and ("TEMPO" in ctx["categories"] and "VERBO" in ctx["categories"]):
+            return True, f"Novo marcador temporal '{new_gloss}' após oração completa já com TEMPO e VERBO ({ctx['glosses']})"
+
+        return False, None
+
+    def add_sign(
+        self,
+        session_id: str,
+        payload: Dict[str, Any],
+        eval_result: Dict[str, Any],
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        """
+        Adiciona um sinal reconhecido ao agregador.
+        Se detectar mudança de contexto, fecha e retorna `(frase_fechada_anterior, contexto_atual)`.
+        Caso contrário, retorna `(None, contexto_atual)`.
+        """
+        gloss = eval_result["recognized_sign"]
+        category = self.pipeline.lexicon_signs.get(gloss, "OUTRO")
+        signer_id = payload.get("signer_id")
+        start_iso = payload.get("start_at")
+        end_iso = payload.get("end_at")
+        start_epoch = parse_iso_timestamp(start_iso)
+        end_epoch = parse_iso_timestamp(end_iso)
+
+        ctx = self.active_contexts.get(session_id)
+        closed_prev: Optional[Dict[str, Any]] = None
+
+        if ctx is not None:
+            is_new, reason = self.check_if_new_context_needed(
+                ctx, gloss, category, start_epoch, signer_id
+            )
+            if is_new:
+                closed_prev = self.close_context(session_id, close_reason=reason)
+                ctx = None
+
+        if ctx is None:
+            ctx = self._new_context(session_id, signer_id)
+            self.active_contexts[session_id] = ctx
+
+        # Se o sinal teve baixa confiança, registra a melhor sugestão alternativa ao lado
+        best_alt = (
+            eval_result["suggested_alternatives"][0]["gloss"]
+            if (eval_result["needs_correction_suggestion"] and eval_result["suggested_alternatives"])
+            else None
+        )
+
+        ctx["glosses"].append(gloss)
+        ctx["categories"].append(category)
+        ctx["signs_detail"].append({
+            "gloss": gloss,
+            "category": category,
+            "confidence": eval_result["confidence"],
+            "needs_suggestion": eval_result["needs_correction_suggestion"],
+            "top_suggestion": best_alt,
+            "alternatives": eval_result["suggested_alternatives"],
+            "start_at": start_iso,
+            "end_at": end_iso,
+        })
+        if ctx["started_at_iso"] is None:
+            ctx["started_at_iso"] = start_iso
+        if end_iso is not None:
+            ctx["last_end_at_iso"] = end_iso
+        if end_epoch is not None:
+            ctx["last_end_epoch"] = end_epoch
+        ctx["last_wallclock_time"] = time.time()
+
+        return closed_prev, ctx
+
+    def add_facial_marker(self, session_id: str, marker_payload: Dict[str, Any]):
+        ctx = self.active_contexts.get(session_id)
+        if ctx is None:
+            ctx = self._new_context(session_id, signer_id=None)
+            self.active_contexts[session_id] = ctx
+        ctx["facial_markers"].append(marker_payload.get("marker", "NEUTRO"))
+        ctx["last_wallclock_time"] = time.time()
+
+    def close_context(self, session_id: str, close_reason: str) -> Optional[Dict[str, Any]]:
+        """Fecha a frase acumulada na sessão, aplica a sintaxe e gera a sugestão da frase completa."""
+        ctx = self.active_contexts.pop(session_id, None)
+        if not ctx or not ctx["glosses"]:
+            return None
+
+        raw_glosses = list(ctx["glosses"])
+        reordered_glosses, was_reordered = self.pipeline.reorganize_syntax(raw_glosses)
+
+        # Monta também a versão da frase caso o usuário aceite as sugestões para sinais de baixa confiança
+        glosses_with_suggestions = [
+            item["top_suggestion"] if (item["needs_suggestion"] and item["top_suggestion"]) else item["gloss"]
+            for item in ctx["signs_detail"]
+        ]
+        reordered_suggested, _ = self.pipeline.reorganize_syntax(glosses_with_suggestions)
+
+        closed_summary = {
+            "context_id": ctx["context_id"],
+            "session_id": session_id,
+            "signer_id": ctx["signer_id"],
+            "close_reason": close_reason,
+            "started_at": ctx["started_at_iso"],
+            "ended_at": ctx["last_end_at_iso"],
+            "raw_gloss_sequence": raw_glosses,
+            "grammatical_gloss_sequence": reordered_glosses,
+            "suggested_corrected_sentence": reordered_suggested,
+            "was_syntactically_reordered": was_reordered,
+            "had_low_confidence_replacements": raw_glosses != glosses_with_suggestions,
+            "facial_markers": ctx["facial_markers"] or ["NEUTRO"],
+            "signs_detail": ctx["signs_detail"],
+        }
+        self.closed_sentences.append(closed_summary)
+        return closed_summary
+
+    def flush_idle_contexts(self) -> List[Dict[str, Any]]:
+        """Verifica se alguma sessão ficou em silêncio além do timeout e fecha a frase."""
+        now = time.time()
+        expired_sessions = [
+            sid for sid, ctx in self.active_contexts.items()
+            if ctx["glosses"] and (now - ctx["last_wallclock_time"]) >= self.realtime_idle_timeout_sec
+        ]
+        closed = []
+        for sid in expired_sessions:
+            res = self.close_context(
+                sid,
+                close_reason=f"Silêncio/inatividade de {self.realtime_idle_timeout_sec:.1f}s (fim da frase detectado)",
+            )
+            if res:
+                closed.append(res)
+        return closed
+
+
+# =============================================================================
+# WORKER KAFKA PRINCIPAL (A6)
+# =============================================================================
+class LibrasCorrectionKafkaWorker:
+    def __init__(
+        self,
         bootstrap_servers: Optional[str] = None,
         group_id: str = DEFAULT_GROUP_ID,
-        input_sign_topic: str = TOPIC_INPUT_SIGN,
-        input_kp_topic: str = TOPIC_INPUT_KEYPOINTS,
-        output_topic: str = TOPIC_OUTPUT_GESTURE,
         pipeline: Optional[LibrasCorrectionPipeline] = None,
+        save_dir: Optional[str | Path] = None,
+        pause_threshold_sec: float = 3.0,
+        realtime_idle_timeout_sec: float = 3.5,
     ):
         self.bootstrap = bootstrap_servers or get_bootstrap_servers()
         self.group_id = group_id
-        self.input_sign_topic = input_sign_topic
-        self.input_kp_topic = input_kp_topic
-        self.output_topic = output_topic
         self.pipeline = pipeline or LibrasCorrectionPipeline()
+        self.aggregator = SentenceContextAggregator(
+            self.pipeline,
+            pause_threshold_sec=pause_threshold_sec,
+            realtime_idle_timeout_sec=realtime_idle_timeout_sec,
+        )
+
+        self.save_dir = Path(save_dir) if save_dir else (Path(__file__).parent / "mensagens_recebidas_kafka")
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self._msg_counter = 0
 
         self._running = False
-        self._consumer = None
-        self._producer = None
+        self._consumer: Optional[Consumer] = None
+        self._producer: Optional[Producer] = None
+        self._seen_message_ids: set[str] = set()
 
-        self._session_frames: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        self._session_gloss_history: Dict[str, List[str]] = defaultdict(list)
+    def _salvar_mensagem_recebida(
+        self,
+        evento_bruto: Dict[str, Any],
+        resultado_processado: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        self._msg_counter += 1
+        schema_slug = str(evento_bruto.get("schema", "unknown")).replace(".", "_")
+        ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        mid_short = str(evento_bruto.get("message_id", "noid"))[:8]
 
-    def _delivery_callback(self, err, msg):
+        registro = {
+            "received_at_local": datetime.now().isoformat(),
+            "raw_kafka_envelope": evento_bruto,
+            "a6_processed_result": resultado_processado,
+        }
+
+        arquivo_individual = self.save_dir / f"{self._msg_counter:03d}_{ts_str}_{schema_slug}_{mid_short}.json"
+        arquivo_individual.write_text(
+            json.dumps(registro, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        arquivo_historico = self.save_dir / "historico_kafka.jsonl"
+        with arquivo_historico.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(registro, ensure_ascii=False) + "\n")
+
+        log.info(" [ARQUIVO SALVO] %s", arquivo_individual.name)
+        return arquivo_individual
+
+    def _salvar_frase_fechada(self, closed_sentence: Dict[str, Any]) -> Path:
+        """Salva um arquivo dedicado sempre que uma frase completa (contexto) é fechada."""
+        cid = closed_sentence["context_id"]
+        arquivo_frase = self.save_dir / f"FRASE_FECHADA_{cid}.json"
+        arquivo_frase.write_text(
+            json.dumps(closed_sentence, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        log.info("==========================================================================")
+        log.info(" >>> [FIM DE FRASE / CONTEXTO FECHADO: %s] <<<", cid)
+        log.info(" Motivo do fechamento        : %s", closed_sentence["close_reason"])
+        log.info(" Sinais recebidos na ordem   : %s", closed_sentence["raw_gloss_sequence"])
+        log.info(" Ordem Gramatical [T+S+O+V]  : %s", closed_sentence["grammatical_gloss_sequence"])
+        if closed_sentence["had_low_confidence_replacements"]:
+            log.info(" Frase c/ Sugestão Aplicada  : %s", closed_sentence["suggested_corrected_sentence"])
+        log.info(" Marcadores Faciais da frase : %s", closed_sentence["facial_markers"])
+        log.info(" Arquivo da frase salvo em   : %s", arquivo_frase)
+        log.info("==========================================================================")
+        return arquivo_frase
+
+    @staticmethod
+    def _delivery_callback(err, msg):
         if err is not None:
-            log.error("Falha ao entregar mensagem no tópico %s: %s", msg.topic(), err)
+            log.error("Falha ao entregar em %s: %s", msg.topic(), err)
         else:
-            log.info("Mensagem entregue com sucesso em [%s] (offset: %s)", msg.topic(), msg.offset())
+            log.info("Mensagem publicada em [%s] (offset: %s)", msg.topic(), msg.offset())
 
     def initialize(self):
         if not HAS_CONFLUENT_KAFKA:
-            raise ImportError(
-                "O pacote 'confluent-kafka' não está instalado neste ambiente Python!\n"
-                "Para instalar, execute: pip install confluent-kafka"
-            )
+            raise ImportError("Instale confluent-kafka: pip install confluent-kafka")
 
-        log.info("Conectando ao broker Kafka em %s", self.bootstrap)
-        consumer_conf = {
+        log.info("Conectando ao broker Kafka em %s (Group ID: %s)", self.bootstrap, self.group_id)
+        self._consumer = Consumer({
             "bootstrap.servers": self.bootstrap,
             "group.id": self.group_id,
-            "auto.offset.reset": os.environ.get("KAFKA_AUTO_OFFSET_RESET", "earliest"),
+            "auto.offset.reset": os.environ.get("KAFKA_AUTO_OFFSET_RESET", "latest"),
             "enable.auto.commit": True,
-            "session.timeout.ms": 30000,
-        }
-        producer_conf = {
+        })
+        self._producer = Producer({
             "bootstrap.servers": self.bootstrap,
             "linger.ms": 20,
-            "acks": "all",
-        }
+        })
 
-        self._consumer = Consumer(consumer_conf)
-        self._producer = Producer(producer_conf)
-
-        topics_to_subscribe = [self.input_sign_topic, self.input_kp_topic]
-        self._consumer.subscribe(topics_to_subscribe)
-        log.info("Inscrito nos tópicos: %s | Group ID: %s", topics_to_subscribe, self.group_id)
+        topics = [TOPIC_I4_SIGN, TOPIC_I4_FACIAL_MARKER, TOPIC_S6_SYNTHESIS_RPL, TOPIC_I4_CAPTURE_RPL]
+        self._consumer.subscribe(topics)
+        log.info("A6 inscrito nos tópicos: %s", topics)
 
     def stop(self, *args, **kwargs):
-        log.info("Encerrando consumidor Kafka...")
+        log.info("Encerrando serviço Kafka A6...")
         self._running = False
 
-    def publish_correction(
+    def request_s6_synthesis(
         self,
-        correction_result: Dict[str, Any],
+        words_or_sentence: List[str] | str,
+        speed_factor: float = 1.0,
+        explicit_marker: Optional[str] = None,
         session_id: Optional[str] = None,
-        correlation_id: Optional[str] = None,
-    ):
-        if not self._producer:
-            log.warning("Producer não inicializado.")
-            return
+    ) -> Dict[str, Any]:
+        prep = self.pipeline.prepare_synthesis_command(
+            input_words_or_sentence=words_or_sentence,
+            speed_factor=speed_factor,
+            explicit_marker=explicit_marker,
+            auto_apply_top_suggestion=True,
+        )
 
-        envelope = build_ods_envelope(
-            schema=self.output_topic,
-            payload=correction_result,
+        log.info("========== [A6 -> S6: PRÉ-VALIDAÇÃO & SUGESTÃO DE CORREÇÃO] ==========")
+        log.info(" Entrada original: %s", prep["input"])
+        if prep["pre_validation"]["word_corrections"]:
+            for wc in prep["pre_validation"]["word_corrections"]:
+                sug_str = ", ".join(f"{s['gloss']} ({s['score']})" for s in wc["suggestions"])
+                log.info(
+                    " [SUGESTÃO APLICADA ANTES DO ENVIO] Palavra '%s' não está no LEXICON -> Substituída por '%s' (Alternativas: [%s])",
+                    wc["original_word"], wc["applied_gloss"], sug_str
+                )
+        else:
+            log.info(" Todas as palavras já pertencem ao LEXICON oficial de 100 sinais.")
+
+        log.info(
+            " Gramática Libras (%s): %s -> %s | Marcador Facial: %s",
+            prep["grammar"]["rule"],
+            prep["grammar"]["before_syntax_order"],
+            prep["grammar"]["after_syntax_order"],
+            prep["grammar"]["facial_marker_applied"],
+        )
+
+        cmd_envelope = build_ods_envelope(
+            message_type="command",
+            schema=TOPIC_S6_SYNTHESIS_CMD,
+            target="S6",
             session_id=session_id,
-            correlation_id=correlation_id,
+            payload=prep["s6_command_payload"],
         )
 
-        key = (session_id or correlation_id or str(uuid.uuid4())).encode("utf-8")
-        val = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+        if self._producer and prep["s6_command_payload"]["glosses"]:
+            key = cmd_envelope["message_id"].encode("utf-8")
+            val = json.dumps(cmd_envelope, ensure_ascii=False).encode("utf-8")
+            self._producer.produce(
+                topic=TOPIC_S6_SYNTHESIS_CMD,
+                key=key,
+                value=val,
+                on_delivery=self._delivery_callback,
+            )
+            self._producer.flush(5.0)
+            log.info(" Comando `ods.s6.synthesis.command` enviado ao S6 (message_id=%s)", cmd_envelope["message_id"])
+        log.info("======================================================================")
+        return cmd_envelope
 
-        self._producer.produce(
-            topic=self.output_topic,
-            key=key,
-            value=val,
-            on_delivery=self._delivery_callback,
-        )
-        self._producer.poll(0)
-
-    def process_message(self, raw_bytes: bytes):
+    def process_message(self, raw_bytes: bytes) -> Optional[Dict[str, Any]]:
         try:
-            msg_dict = json.loads(raw_bytes.decode("utf-8"))
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            log.warning("Descartando mensagem malformatada (JSON Inválido): %s", e)
-            return
+            evento = json.loads(raw_bytes.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            log.warning("mensagem descartada: JSON inválido")
+            return None
 
-        is_valid, reason = validate_ods_envelope(msg_dict)
-        if not is_valid:
-            log.warning("Envelope inválido descartado: %s", reason)
-            return
+        valido, motivo = validate_ods_envelope(evento)
+        if not valido:
+            log.warning("mensagem descartada: %s", motivo)
+            return None
 
-        schema = msg_dict.get("schema")
-        payload = msg_dict.get("payload", {})
-        session_id = msg_dict.get("session_id", "default_session")
-        message_id = msg_dict.get("message_id")
+        mid = evento["message_id"]
+        if mid in self._seen_message_ids:
+            return None
+        self._seen_message_ids.add(mid)
 
-        if schema == self.input_kp_topic or "keypoints" in schema:
-            self._session_frames[session_id].append(payload)
-            if len(self._session_frames[session_id]) > 300:
-                self._session_frames[session_id].pop(0)
+        schema = evento["schema"]
+        payload = evento["payload"]
+        session_id = evento.get("session_id", "default_session")
 
-        elif schema == self.input_sign_topic or "sign" in schema:
-            sign_label = payload.get("sign") or payload.get("sinal", "DESCONHECIDO")
-            confidence = float(payload.get("confidence") or payload.get("confianca", 1.0))
+        # ---------------------------------------------------------------------
+        # CASO A: Evento `ods.i4.sign` vindo de I4 em tempo real
+        # ---------------------------------------------------------------------
+        if schema == TOPIC_I4_SIGN:
+            # Avalia o sinal isolado (confiança + alternativas)
+            current_ctx = self.aggregator.active_contexts.get(session_id)
+            history_before = list(current_ctx["glosses"]) if current_ctx else []
+            result = self.pipeline.evaluate_incoming_i4_sign(payload, session_history=history_before)
 
-            log.info("Sinal recebido: '%s' (confiança: %.2f) na sessão %s", sign_label, confidence, session_id)
+            # Passa para o Agregador de Contexto decidir se continua na mesma frase ou abre nova!
+            closed_prev, active_ctx = self.aggregator.add_sign(session_id, payload, result)
 
-            keypoint_seq = self._session_frames.pop(session_id, [])
-            if not keypoint_seq and "keypoints" in payload:
-                keypoint_seq = payload["keypoints"]
+            if closed_prev is not None:
+                self._salvar_frase_fechada(closed_prev)
 
-            history = self._session_gloss_history[session_id]
+            # Atualiza o contexto da frase no resultado para salvar junto no JSON
+            reordered_now, _ = self.pipeline.reorganize_syntax(active_ctx["glosses"])
+            result["context_tracking"] = {
+                "context_id": active_ctx["context_id"],
+                "switched_to_new_context": closed_prev is not None,
+                "previous_closed_context": closed_prev,
+                "active_glosses_in_context": list(active_ctx["glosses"]),
+                "active_grammatical_order": reordered_now,
+            }
 
-            correction = self.pipeline.process_sign_window(
-                sign_label=sign_label,
-                confidence=confidence,
-                keypoints=keypoint_seq,
-                context_glosses=history,
-            )
+            log.info("---------- [I4 -> A6: SINAL EM TEMPO REAL (%s)] ----------", active_ctx["context_id"])
+            log.info(" Glosa recebida: '%s' (conf=%.2f) | Contexto atual: %s",
+                     result["recognized_sign"], result["confidence"], active_ctx["glosses"])
+            if result["needs_correction_suggestion"]:
+                alts = [f"{a['gloss']} ({a['confidence']:.2f})" for a in result["suggested_alternatives"]]
+                log.info(" [SUGESTÃO DE PALAVRAS] Confiança baixa! Alternativas p/ '%s': %s",
+                         result["recognized_sign"], alts)
+            self._salvar_mensagem_recebida(evento, result)
+            return result
 
-            self._session_gloss_history[session_id].append(sign_label.upper())
+        # ---------------------------------------------------------------------
+        # Marcador Facial Gramatical (`ods.i4.facial_marker`)
+        # ---------------------------------------------------------------------
+        elif schema == TOPIC_I4_FACIAL_MARKER:
+            marker = payload.get("marker", "NEUTRO")
+            conf = float(payload.get("confidence", 0.0))
+            self.aggregator.add_facial_marker(session_id, payload)
+            log.info("[I4 -> A6: MARCADOR FACIAL] Marcador='%s' (conf=%.2f) anexado à frase ativa", marker, conf)
+            self._salvar_mensagem_recebida(evento, payload)
+            return payload
 
-            self.publish_correction(
-                correction_result=correction,
-                session_id=session_id,
-                correlation_id=message_id,
-            )
+        # ---------------------------------------------------------------------
+        # Reply de Síntese (`ods.s6.synthesis.reply`)
+        # ---------------------------------------------------------------------
+        elif schema == TOPIC_S6_SYNTHESIS_RPL:
+            eval_rpl = self.pipeline.evaluate_s6_synthesis_reply(payload)
+            log.info("========== [S6 -> A6: REPLY DE SÍNTESE (`ods.s6.synthesis.reply`)] ==========")
+            log.info(" Status: %s | Trajetória: %s | Duração: %s ms",
+                     eval_rpl["status"], eval_rpl["trajectory_ref"], eval_rpl["duration_ms"])
+            if eval_rpl["has_unknown_signs"]:
+                for unk, sugs in eval_rpl["suggestions_for_unknown_signs"].items():
+                    sug_names = [f"{s['gloss']} ({s['score']})" for s in sugs]
+                    log.info(" [SUGESTÃO P/ `unknown_signs`] '%s' -> %s", unk, sug_names)
+            self._salvar_mensagem_recebida(evento, eval_rpl)
+            log.info("=============================================================================")
+            return eval_rpl
 
-            # Detalhes das sugestões e correções geradas pelo Módulo 5
-            log.info("========== [MÓDULO 5: SUGESTÕES & CORREÇÕES GERADAS] ==========")
-            log.info(" Sinal: %s (Confiança: %.2f)", sign_label, confidence)
-            log.info(" Fonologia Estimada: %s", correction["phonology"])
-            if correction["biomechanical_corrections"]:
-                log.info(" Correções Biomecânicas: %s", correction["biomechanical_corrections"])
-            else:
-                log.info(" Biomecânica: Articulações dentro dos limites anatômicos normais.")
-            
-            sintaxe = correction["syntactic_correction"]
-            if sintaxe["was_reordered"]:
-                log.info(" Sugestão Sintática (Reordenação): %s ➔ %s (Regra: %s)", sintaxe["original"], sintaxe["reordered"], sintaxe["rule"])
-            else:
-                log.info(" Sintaxe: Glosas em conformidade gramatical (%s).", sintaxe["reordered"])
-
-            log.info(" Avatar 3D: %d frames gerados e prontos para o avatar.", len(correction["avatar_frames"]))
-            log.info(" Publicado no barramento em: '%s'", self.output_topic)
-            log.info("==================================================================")
+        self._salvar_mensagem_recebida(evento, None)
+        return None
 
     def run(self):
         self.initialize()
         self._running = True
-
         signal.signal(signal.SIGINT, self.stop)
         signal.signal(signal.SIGTERM, self.stop)
 
-        log.info("Iniciando loop de consumo do Módulo 5 (A6)...")
+        log.info("Loop de consumo A6 iniciado (poll=1.0s | Fecha frase após %.1fs de pausa)...",
+                 self.aggregator.realtime_idle_timeout_sec)
         try:
             while self._running:
-                msg = self._consumer.poll(timeout=1.0)
+                msg = self._consumer.poll(1.0)
                 if msg is None:
+                    # Verifica se alguma frase aberta já terminou por silêncio do sinalizador
+                    for closed in self.aggregator.flush_idle_contexts():
+                        self._salvar_frase_fechada(closed)
                     continue
-
                 if msg.error():
                     if msg.error().code() != KafkaError._PARTITION_EOF:
-                        log.error("Erro Kafka recebido: %s", msg.error())
+                        log.error("Erro no Kafka: %s", msg.error())
                     continue
-
                 self.process_message(msg.value())
-
-        except Exception as exc:
-            log.exception("Exceção no loop do Kafka: %s", exc)
+                # Checa timeouts também entre mensagens
+                for closed in self.aggregator.flush_idle_contexts():
+                    self._salvar_frase_fechada(closed)
         finally:
-            log.info("Finalizando e esvaziando filas...")
+            # Ao encerrar, fecha qualquer frase que estivesse em aberto
+            for sid in list(self.aggregator.active_contexts.keys()):
+                closed = self.aggregator.close_context(sid, close_reason="Encerramento do serviço")
+                if closed:
+                    self._salvar_frase_fechada(closed)
             if self._producer:
                 self._producer.flush(5.0)
             if self._consumer:
                 self._consumer.close()
-            log.info("Módulo 5 desconectado com sucesso.")
+            log.info("Serviço Kafka A6 encerrado com segurança.")
 
 
 if __name__ == "__main__":
