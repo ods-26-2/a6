@@ -1,0 +1,12 @@
+envs/
+.venv/
+venv/
+__pycache__/
+.git/
+dataset_maos/imagens/
+saida_frames_aluno/
+mensagens_recebidas_kafka/
+avatar/*.fbx
+avatar/geral/
+avatar/saida/*.mp4
+avatar/saida/*.png
