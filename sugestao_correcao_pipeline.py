@@ -9,6 +9,7 @@ Opera EXCLUSIVAMENTE sobre palavras/glosas e metadados gramaticais (sem manipula
    - Avalia `confidence`. Quando baixa ou fora do léxico, oferece as alternativas de `alternatives`
      para manter a conversa fluindo sem falhar em silêncio.
 3. Sentido Português -> Libras (Saída p/ S6: `ods.s6.synthesis.command` e `ods.s6.synthesis.reply`):
+   - Remove as stopwords do Português ANTES de iniciar o processo de validação e correção.
    - Faz a PRÉ-VALIDAÇÃO local ANTES de enviar para o S6: compara cada palavra contra o LEXICON de 100 palavras,
      sugerindo e aplicando substituições por sinônimos ou proximidade ortográfica (Levenshtein/SequenceMatcher).
    - Aplica a gramática própria da LIBRAS: ordem canônica [TEMPO] + [SUJEITO] + [OBJETO] + [VERBO] e
@@ -208,12 +209,20 @@ class LibrasCorrectionPipeline:
         "CONSEGUIR": "PODER",
     }
 
-    # Palavras funcionais do Português que são omitidas na glosa de Libras (artigos, preposições, etc.)
+    # Palavras funcionais do Português que são omitidas na glosa de Libras
+    # (artigos, preposições, conjunções, verbos de ligação e contrações sem acento)
     PORTUGUESE_STOPWORDS = {
         "O", "A", "OS", "AS", "UM", "UMA", "UNS", "UMAS",
-        "DE", "DO", "DA", "DOS", "DAS", "EM", "NO", "NA", "NOS", "NAS",
-        "PARA", "PRO", "PRA", "COM", "POR", "QUE", "E", "MAS", "OU", "SE",
-        "ESTA", "ESTE", "ISSO", "ERA", "FOI", "SER", "ESTAR", "MUITO", "MAIS"
+        "DE", "DO", "DA", "DOS", "DAS", "DUM", "DUMA",
+        "EM", "NO", "NA", "NOS", "NAS", "NUM", "NUMA",
+        "PARA", "PRO", "PRA", "PROS", "PRAS", "COM", "POR",
+        "PELO", "PELA", "PELOS", "PELAS", "AO", "AOS", "ATE",
+        "QUE", "E", "MAS", "OU", "SE", "COMO", "POIS", "POREM",
+        "ESTA", "ESTE", "ESTES", "ESTAS", "ESSE", "ESSA", "ESSES", "ESSAS",
+        "ISSO", "ISTO", "AQUILO", "AQUELE", "AQUELA", "AQUELES", "AQUELAS",
+        "ERA", "FOI", "SER", "ESTAR", "SOU", "ES", "SOMOS", "SAO",
+        "ESTOU", "ESTAMOS", "ESTAO", "ESTAVA", "FORAM", "SEJA",
+        "MUITO", "MAIS", "JA", "TAMBEM", "SO", "LHE", "LHES", "ME", "TE", "SE", "NOS"
     }
 
     # Palavras interrogativas e de negação para ativar marcadores faciais
@@ -246,15 +255,53 @@ class LibrasCorrectionPipeline:
         raise FileNotFoundError(f"Artefato LEXICON não encontrado em: {path}")
 
     # =========================================================================
+    # 0. REMOÇÃO PRÉVIA DE STOPWORDS DO PORTUGUÊS
+    # =========================================================================
+    def is_stopword(self, word: str) -> bool:
+        """
+        Verifica se a palavra normalizada é uma stopword do português.
+        Preserva palavras que façam parte do LEXICON oficial, de perguntas QU ou de negação.
+        """
+        norm = normalize_gloss(word)
+        if not norm:
+            return True
+        if norm in self.lexicon_signs or norm in self.QUESTION_QU_WORDS or norm in self.NEGATION_WORDS:
+            return False
+        return norm in self.PORTUGUESE_STOPWORDS
+
+    def remove_portuguese_stopwords(self, tokens: List[str]) -> Tuple[List[str], List[str]]:
+        """
+        Remove stopwords em português de uma lista de tokens ANTES de iniciar as correções.
+        Retorna (tokens_filtrados, stopwords_removidas).
+        """
+        filtered_tokens: List[str] = []
+        removed_stopwords: List[str] = []
+
+        for raw_token in tokens:
+            if raw_token in ("?", "!"):
+                continue
+            norm = normalize_gloss(raw_token)
+            if not norm:
+                continue
+
+            if self.is_stopword(norm):
+                removed_stopwords.append(raw_token)
+            else:
+                filtered_tokens.append(raw_token)
+
+        return filtered_tokens, removed_stopwords
+
+    # =========================================================================
     # 1. SUGESTÃO DE PALAVRAS DO LÉXICO (Sinônimos + Proximidade Textual)
     # =========================================================================
     def suggest_alternatives_for_word(self, word: str, max_suggestions: int = 3) -> List[Dict[str, Any]]:
         """
         Dada uma palavra que não está no LEXICON de 100 sinais, retorna uma lista ordenada
         de sugestões válidas do LEXICON (usando sinônimos diretos e similaridade de caracteres).
+        Ignora stopwords do português para evitar falsos positivos por similaridade ortográfica.
         """
         norm = normalize_gloss(word)
-        if not norm:
+        if not norm or self.is_stopword(norm):
             return []
 
         # Se já existe no léxico, ela mesma é 100% válida
@@ -314,21 +361,25 @@ class LibrasCorrectionPipeline:
     ) -> Dict[str, Any]:
         """
         Compara todas as palavras contra o LEXICON de 100 palavras ANTES de enviar ao S6:
-        - Filtra stopwords do português;
-        - Identifica marcadores faciais gramaticais (Pergunta, Negação, Intensidade);
-        - Sugere e aplica correções para palavras fora do léxico;
-        - Reordena as glosas na gramática de LIBRAS: [TEMPO] + [SUJEITO] + [OBJETO] + [VERBO];
-        - Devolve o payload pronto de `ods.s6.synthesis.command` + relatório de sugestões.
+        - Passo 1: Remove as stopwords em português antes de começar as correções;
+        - Passo 2: Identifica marcadores faciais gramaticais (Pergunta, Negação, Intensidade);
+        - Passo 3: Sugere e aplica correções para palavras fora do léxico;
+        - Passo 4: Reordena as glosas na gramática de LIBRAS: [TEMPO] + [SUJEITO] + [OBJETO] + [VERBO];
+        - Passo 5: Devolve o payload pronto de `ods.s6.synthesis.command` + relatório de sugestões.
         """
         if isinstance(input_words_or_sentence, str):
             raw_text = input_words_or_sentence
-            tokens = raw_text.replace("?", " ? ").replace("!", " ! ").split()
+            raw_tokens = raw_text.replace("?", " ? ").replace("!", " ! ").split()
         else:
             raw_text = " ".join(input_words_or_sentence)
-            tokens = list(input_words_or_sentence)
+            raw_tokens = list(input_words_or_sentence)
 
         has_question_mark = "?" in raw_text
         has_exclamation = "!" in raw_text
+
+        # 1. Remove as stopwords em português ANTES de começar as correções
+        tokens_without_stopwords, removed_stopwords = self.remove_portuguese_stopwords(raw_tokens)
+
         detected_qu = False
         detected_negation = False
 
@@ -336,9 +387,8 @@ class LibrasCorrectionPipeline:
         word_corrections: List[Dict[str, Any]] = []
         unresolved_words: List[str] = []
 
-        for raw_token in tokens:
-            if raw_token in ("?", "!"):
-                continue
+        # 2. Inicia as correções apenas sobre os tokens relevantes
+        for raw_token in tokens_without_stopwords:
             norm = normalize_gloss(raw_token)
             if not norm:
                 continue
@@ -350,8 +400,6 @@ class LibrasCorrectionPipeline:
                 detected_negation = True
                 if norm not in self.lexicon_signs:
                     continue
-            if norm in self.PORTUGUESE_STOPWORDS and norm not in self.lexicon_signs:
-                continue
 
             # Palavra já existe diretamente no LEXICON de 100 sinais
             if norm in self.lexicon_signs:
@@ -407,6 +455,8 @@ class LibrasCorrectionPipeline:
         return {
             "input": input_words_or_sentence,
             "pre_validation": {
+                "removed_stopwords": removed_stopwords,
+                "tokens_after_stopword_removal": tokens_without_stopwords,
                 "all_in_lexicon_originally": len(word_corrections) == 0,
                 "word_corrections": word_corrections,
                 "unresolved_words": unresolved_words,
@@ -501,12 +551,13 @@ class LibrasCorrectionPipeline:
     def evaluate_s6_synthesis_reply(self, reply_payload: Dict[str, Any]) -> Dict[str, Any]:
         """
         Analisa a reply `ods.s6.synthesis.reply` vinda de S6:
-        - Se `unknown_signs` vier preenchido, oferece imediatamente alternativas do LEXICON de 100 palavras.
+        - Se `unknown_signs` vier preenchido, remove eventuais stopwords e oferece alternativas do LEXICON.
         """
-        unknown_signs = reply_payload.get("unknown_signs") or []
-        suggestions_by_unknown: Dict[str, List[Dict[str, Any]]] = {}
+        raw_unknown_signs = reply_payload.get("unknown_signs") or []
+        filtered_unknowns, removed_stopwords = self.remove_portuguese_stopwords(raw_unknown_signs)
 
-        for unk in unknown_signs:
+        suggestions_by_unknown: Dict[str, List[Dict[str, Any]]] = {}
+        for unk in filtered_unknowns:
             suggestions_by_unknown[unk] = self.suggest_alternatives_for_word(unk)
 
         return {
@@ -514,8 +565,9 @@ class LibrasCorrectionPipeline:
             "trajectory_ref": reply_payload.get("trajectory_ref"),
             "duration_ms": reply_payload.get("duration_ms"),
             "facial_markers": reply_payload.get("facial_markers", []),
-            "unknown_signs": unknown_signs,
-            "has_unknown_signs": len(unknown_signs) > 0,
+            "unknown_signs": filtered_unknowns,
+            "ignored_stopwords": removed_stopwords,
+            "has_unknown_signs": len(filtered_unknowns) > 0,
             "suggestions_for_unknown_signs": suggestions_by_unknown,
         }
 

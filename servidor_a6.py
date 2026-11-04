@@ -342,7 +342,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>A6 · Tradutor Bidirecional de LIBRAS & Avatar 3D (Arquitetura 6c)</title>
+  <title>Componente A6</title>
   <script type="module" src="https://ajax.googleapis.com/ajax/libs/model-viewer/3.5.0/model-viewer.min.js"></script>
   <style>
     :root {
@@ -408,7 +408,7 @@ INDEX_HTML = """<!DOCTYPE html>
 <body>
   <header>
     <div>
-      <h1>🤟 A6 · Tradutor Bidirecional de LIBRAS & Avatar 3D (Camada 4 · Arquitetura 6c)</h1>
+      <h1>A6 · Tradutor Bidirecional de LIBRAS & Avatar 3D (Camada 4 · Arquitetura 6c)</h1>
       <div style="font-size: 0.82rem; color: var(--muted);">
         Integração em Tempo Real via Kafka com <b>I4</b> (Captura/Visão) e <b>S6</b> (Síntese de Trajetórias) + Sugestão de Correção
       </div>
