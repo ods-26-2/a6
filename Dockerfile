@@ -12,7 +12,8 @@ COPY kafka_integration.py /app/kafka_integration.py
 COPY mock_s6_e_i4.py /app/mock_s6_e_i4.py
 COPY servidor_a6.py /app/servidor_a6.py
 COPY avatar/ybot.glb /app/avatar/ybot.glb
-COPY trajectories_mock/ /app/trajectories_mock/
+COPY dataset_maos/keypoints/ /app/dataset_maos/keypoints/
+RUN mkdir -p /app/trajectories_mock /app/mensagens_recebidas_kafka
 
 # Variáveis de ambiente padrão (Cloud Run injeta PORT automaticamente)
 ENV PORT=8080
