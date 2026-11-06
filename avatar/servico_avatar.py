@@ -176,8 +176,10 @@ def renderizar(arquivo: Optional[str], cfg: argparse.Namespace) -> Dict[str, Any
         line = line.rstrip("\n")
         print("   |", line, flush=True)
         tail = (tail + [line])[-15:]
-        if line.startswith("VIDEO:"):
-            videos.append(line.split(":", 1)[1].strip())
+        if line.startswith("GLB:") or line.startswith("VIDEO:"):
+            v = line.split(":", 1)[1].strip()
+            if v not in videos:
+                videos.append(v)
     rc = proc.wait()
     return {"returncode": rc, "videos": videos, "tail": tail}
 
@@ -289,7 +291,7 @@ class ServicoAvatar:
             if payload.get("trajectory_ref"):
                 self.rendered.add(payload["trajectory_ref"])
             for v in reply["videos"]:
-                log.info("VIDEO GERADO: %s", v["path"])
+                log.info("ARTEFATO (.GLB) GERADO: %s", v["path"])
         else:
             log.error("Render falhou: %s", reply["error"])
 

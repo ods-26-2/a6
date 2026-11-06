@@ -27,6 +27,7 @@ import json
 import logging
 import mimetypes
 import os
+import subprocess
 import threading
 import time
 import uuid
@@ -171,6 +172,24 @@ class A6ApplicationBackend:
                 traj_frames = traj_doc.get("frames", [])[:90]
             except Exception:
                 pass
+
+            # Gera o .glb animado em background para visualização 3D imediata no site
+            def _gerar_glb():
+                try:
+                    candidatos_py = [
+                        BASE_DIR / ".venv" / "blender" / "bin" / "python",
+                        BASE_DIR / ".venv" / "blender" / "Scripts" / "python.exe",
+                        BASE_DIR / "envs" / "blender" / "bin" / "python",
+                        BASE_DIR / "envs" / "blender" / "Scripts" / "python.exe",
+                    ]
+                    py_blender = next((str(p) for p in candidatos_py if p.exists() or p.is_symlink()), None)
+                    if py_blender:
+                        cmd = [py_blender, str(BASE_DIR / "avatar" / "generate_video.py"), "--arquivo", str(traj_path)]
+                        subprocess.run(cmd, timeout=60)
+                except Exception as exc:
+                    log.warning("Falha ao disparar generate_video.py pelo servidor web: %s", exc)
+
+            threading.Thread(target=_gerar_glb, daemon=True).start()
 
         record = {
             "timestamp": time.strftime("%H:%M:%S"),
@@ -508,6 +527,9 @@ INDEX_HTML = """<!DOCTYPE html>
       </div>
 
       <model-viewer id="avatarViewer" src="/avatar/saida/aluno_corrigido.glb" camera-controls autoplay shadow-intensity="1" ar></model-viewer>
+      <div class="row" style="margin-top:6px; margin-bottom:10px; gap:8px;">
+        <button type="button" class="btn" onclick="replayAvatar()" style="flex:1; padding:7px 12px; font-size:0.85rem;">🔄 Replay da Animação (Tocar Novamente)</button>
+      </div>
 
       <div>
         <div class="row" style="justify-content:space-between; margin-bottom:4px;">
@@ -535,10 +557,41 @@ INDEX_HTML = """<!DOCTYPE html>
       if (viewer) viewer.timeScale = currentSpeedFactor;
     }
 
+    function replayAvatar() {
+      const viewer = document.getElementById('avatarViewer');
+      if (viewer) {
+        viewer.currentTime = 0;
+        try {
+          viewer.play({ repetitions: 1 });
+        } catch (e) {
+          viewer.play();
+        }
+      }
+    }
+
     function changeGlbModel(src) {
       const viewer = document.getElementById('avatarViewer');
-      if (viewer) viewer.src = src;
+      if (viewer) {
+        viewer.src = src;
+        viewer.currentTime = 0;
+        try {
+          viewer.play({ repetitions: 1 });
+        } catch (e) {
+          viewer.play();
+        }
+      }
     }
+
+    // Configura o model-viewer para tocar 1 vez e parar na pose de repouso
+    window.addEventListener('DOMContentLoaded', () => {
+      const v = document.getElementById('avatarViewer');
+      if (v) {
+        v.addEventListener('load', () => {
+          v.currentTime = 0;
+          try { v.play({ repetitions: 1 }); } catch (e) { v.play(); }
+        });
+      }
+    });
 
     async function fetchState() {
       try {
@@ -665,6 +718,16 @@ INDEX_HTML = """<!DOCTYPE html>
         currentTrajIndex = 0;
         document.getElementById('trajStatus').innerText = `Reproduzindo ${currentTrajFrames.length} frames (${rpl.fps} FPS)`;
       }
+
+      // Atualiza o model-viewer com o novo .glb assim que terminar de exportar
+      setTimeout(() => {
+        const viewer = document.getElementById('avatarViewer');
+        if (viewer) {
+          viewer.src = `/avatar/saida/aluno_corrigido.glb?t=${Date.now()}`;
+          viewer.currentTime = 0;
+          try { viewer.play({ repetitions: 1 }); } catch (e) { viewer.play(); }
+        }
+      }, 1600);
     }
 
     async function sendI4Sign(sign, confidence, alternatives, facial_marker, gap_seconds) {

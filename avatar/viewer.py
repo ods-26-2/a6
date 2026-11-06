@@ -95,25 +95,45 @@ class Viewer(ShowBase):
         self.anims = list(self.actor.getAnimNames())
         self.current = None
         self.playing = False
+        self.looping = False
         if self.anims:
             self._play(0)
 
     def _play(self, i):
         if i < len(self.anims):
             self.current = self.anims[i]
-            self.actor.loop(self.current)
+            self.actor.stop()
+            if self.looping:
+                self.actor.loop(self.current)
+            else:
+                self.actor.play(self.current)
             self.playing = True
             self._update_hud()
+
+    def _replay(self):
+        if not self.current:
+            return
+        self.actor.stop()
+        if self.looping:
+            self.actor.loop(self.current)
+        else:
+            self.actor.play(self.current)
+        self.playing = True
+        self._update_hud()
 
     def _toggle(self):
         if not self.current:
             return
         if self.playing:
             self.actor.stop()
+            self.playing = False
         else:
-            self.actor.loop(self.current)
-        self.playing = not self.playing
+            self._replay()
         self._update_hud()
+
+    def _toggle_loop(self):
+        self.looping = not self.looping
+        self._replay()
 
     def _update_hud(self):
         if not hasattr(self, "hud"):
@@ -121,7 +141,8 @@ class Viewer(ShowBase):
         if self.anims:
             lines = [f"[{i + 1}] {n}{'  <' if n == self.current else ''}"
                      for i, n in enumerate(self.anims[:9])]
-            txt = "\n".join(lines) + "\nESPACO: pausar"
+            mode_str = "Loop: LIGADO" if self.looping else "Loop: DESLIGADO (toca 1x e para)"
+            txt = "\n".join(lines) + f"\nR: Replay | ESPACO: Pausar/Continuar | L: {mode_str} | C: Camera"
         else:
             txt = "Modelo sem animacoes (pose estatica)"
         self.hud.setText(txt)
@@ -137,7 +158,9 @@ class Viewer(ShowBase):
         self.accept("wheel_up", self._zoom, [0.9])
         self.accept("wheel_down", self._zoom, [1.1])
         self.accept("space", self._toggle)
-        self.accept("r", self._reset_camera)
+        self.accept("r", self._replay)
+        self.accept("c", self._reset_camera)
+        self.accept("l", self._toggle_loop)
         self.accept("escape", sys.exit)
         for n in range(1, 10):
             self.accept(str(n), self._play, [n - 1])

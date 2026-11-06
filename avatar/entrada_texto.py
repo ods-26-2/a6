@@ -147,8 +147,8 @@ def processar_frase(s: Sessao, texto: str, speed: float, timeout_s6: float,
         print(f" [A6] render pedido explicitamente -> {TOPIC_A6_AVATAR_CMD}")
     else:
         correlacao = cmd["message_id"]   # o servico renderiza ao ouvir a reply do S6
-        print(" [A6] o servico_avatar.py gera o video ao receber a reply do S6.")
-    print(f" Aguardando o video (ate {timeout_video:.0f}s)...")
+        print(" [A6] o servico_avatar.py gera o .glb animado ao receber a reply do S6.")
+    print(f" Aguardando o avatar .glb (ate {timeout_video:.0f}s)...")
     out = s.aguardar_reply(TOPIC_A6_AVATAR_RPL, correlacao, timeout_video)
     if out is None:
         print(" [AVISO] Sem resposta do servico_avatar.py (ele esta rodando?).")
@@ -156,7 +156,7 @@ def processar_frase(s: Sessao, texto: str, speed: float, timeout_s6: float,
     p = out.get("payload", {})
     if p.get("status") == "OK":
         for v in p.get("videos", []):
-            print(f" [VIDEO PRONTO] {v['path']}")
+            print(f" [AVATAR (.GLB) PRONTO] {v['path']}")
     else:
         print(f" [ERRO NO RENDER] {p.get('error')}")
 
