@@ -78,7 +78,7 @@ class MockS6AndI4Service:
         self.trajectory_dir = (
             Path(trajectory_dir)
             if trajectory_dir
-            else (Path(__file__).parent / "trajectories_mock")
+            else (Path(__file__).parent / "avatar" / "entry")
         )
         self.trajectory_dir.mkdir(parents=True, exist_ok=True)
 
@@ -90,6 +90,33 @@ class MockS6AndI4Service:
         self._producer: Optional[Producer] = None
         self._seen_commands: Dict[str, Dict[str, Any]] = {}
 
+    @staticmethod
+    def _ensure_s6_frame_format(raw_frame: Dict[str, Any]) -> Dict[str, Any]:
+        """Garante que o frame tenha `body`, `left_hand`, `right_hand` (formato S6/trajectory_format.py)."""
+        if any(k in raw_frame for k in ("body", "left_hand", "right_hand")):
+            return raw_frame
+
+        aspect = 1280.0 / 720.0
+        left_hand = None
+        right_hand = None
+        for m in raw_frame.get("maos", []):
+            kps = sorted(m.get("keypoints", []), key=lambda k: k.get("id", 0))
+            if len(kps) >= 21:
+                pts = [[ float(k["x"]) * aspect, float(k["y"]), float(k["z"]) * aspect ] for k in kps[:21]]
+                # MediaPipe Hands usa rótulo de imagem espelhada ("Right" na imagem = mão esquerda anatômica)
+                if m.get("lado") == "Right":
+                    left_hand = pts
+                else:
+                    right_hand = pts
+
+        return {
+            "body": [],
+            "left_hand": left_hand,
+            "right_hand": right_hand,
+            "maos": raw_frame.get("maos", []),
+            "corpo": raw_frame.get("corpo", []),
+        }
+
     def _load_sample_avatar_frames(self) -> List[Dict[str, Any]]:
         """Carrega quadros reais do repositório A6 para compor o arquivo de trajetória."""
         sample_file = Path(__file__).parent / "saida_correcoes" / "exemplo_aluno_avatar.json"
@@ -97,20 +124,21 @@ class MockS6AndI4Service:
             try:
                 data = json.loads(sample_file.read_text(encoding="utf-8-sig"))
                 if isinstance(data, list) and data:
-                    return data[:30]
+                    return [self._ensure_s6_frame_format(f) for f in data[:30]]
             except Exception:
                 pass
 
-        # Fallback para um frame de dataset_maos/keypoints
+        # Fallback para frames reais de dataset_maos/keypoints
         kp_dir = Path(__file__).parent / "dataset_maos" / "keypoints"
         frames = []
         if kp_dir.exists():
             for p in sorted(kp_dir.glob("*.json"))[:15]:
                 try:
-                    frames.append(json.loads(p.read_text(encoding="utf-8-sig")))
+                    raw = json.loads(p.read_text(encoding="utf-8-sig"))
+                    frames.append(self._ensure_s6_frame_format(raw))
                 except Exception:
                     pass
-        return frames or [{"maos": [], "corpo": []}]
+        return frames or [{"body": [], "left_hand": None, "right_hand": None, "maos": [], "corpo": []}]
 
     def _generate_trajectory_file(
         self,
@@ -118,7 +146,7 @@ class MockS6AndI4Service:
         effective_fps: float,
         total_frames: int,
     ) -> str:
-        """Salva um arquivo de trajetória em `a6/trajectories_mock/` e retorna a URI `s6://trajectories/...`."""
+        """Salva um arquivo de trajetória em `avatar/entry/` e retorna a URI `s6://trajectories/...`."""
         file_id = f"traj_{uuid.uuid4().hex[:10]}.json"
         out_path = self.trajectory_dir / file_id
 
