@@ -11,7 +11,7 @@ COPY sugestao_correcao_pipeline.py /app/sugestao_correcao_pipeline.py
 COPY kafka_integration.py /app/kafka_integration.py
 COPY mock_s6_e_i4.py /app/mock_s6_e_i4.py
 COPY servidor_a6.py /app/servidor_a6.py
-COPY avatar/ybot.glb /app/avatar/ybot.glb
+COPY avatar/ /app/avatar/
 COPY dataset_maos/keypoints/ /app/dataset_maos/keypoints/
 RUN mkdir -p /app/trajectories_mock /app/mensagens_recebidas_kafka
 

@@ -526,7 +526,7 @@ INDEX_HTML = """<!DOCTYPE html>
         </select>
       </div>
 
-      <model-viewer id="avatarViewer" src="/avatar/saida/aluno_corrigido.glb" camera-controls autoplay shadow-intensity="1" ar></model-viewer>
+      <model-viewer id="avatarViewer" src="/avatar/saida/aluno_corrigido.glb" animation-name="ArmatureAction" camera-controls autoplay shadow-intensity="1" ar></model-viewer>
       <div class="row" style="margin-top:6px; margin-bottom:10px; gap:8px;">
         <button type="button" class="btn" onclick="replayAvatar()" style="flex:1; padding:7px 12px; font-size:0.85rem;">🔄 Replay da Animação (Tocar Novamente)</button>
       </div>
@@ -562,6 +562,7 @@ INDEX_HTML = """<!DOCTYPE html>
       if (viewer) {
         viewer.currentTime = 0;
         try {
+          viewer.animationName = 'ArmatureAction';
           viewer.play({ repetitions: 1 });
         } catch (e) {
           viewer.play();
@@ -582,13 +583,23 @@ INDEX_HTML = """<!DOCTYPE html>
       }
     }
 
-    // Configura o model-viewer para tocar 1 vez e parar na pose de repouso
+    // Configura o model-viewer para selecionar a trilha ArmatureAction e tocar
     window.addEventListener('DOMContentLoaded', () => {
       const v = document.getElementById('avatarViewer');
       if (v) {
         v.addEventListener('load', () => {
-          v.currentTime = 0;
-          try { v.play({ repetitions: 1 }); } catch (e) { v.play(); }
+          try {
+            const anims = v.availableAnimations || [];
+            if (anims.includes('ArmatureAction')) {
+              v.animationName = 'ArmatureAction';
+            } else if (anims.length > 0) {
+              v.animationName = anims[0];
+            }
+            v.currentTime = 0;
+            v.play({ repetitions: 1 });
+          } catch (e) {
+            try { v.play(); } catch (_) {}
+          }
         });
       }
     });
@@ -725,7 +736,12 @@ INDEX_HTML = """<!DOCTYPE html>
         if (viewer) {
           viewer.src = `/avatar/saida/aluno_corrigido.glb?t=${Date.now()}`;
           viewer.currentTime = 0;
-          try { viewer.play({ repetitions: 1 }); } catch (e) { viewer.play(); }
+          try {
+            viewer.animationName = 'ArmatureAction';
+            viewer.play({ repetitions: 1 });
+          } catch (e) {
+            viewer.play();
+          }
         }
       }, 1600);
     }
@@ -774,23 +790,73 @@ INDEX_HTML = """<!DOCTYPE html>
         ctx.clearRect(0, 0, canvas.width, canvas.height);
         const frame = currentTrajFrames[Math.floor(currentTrajIndex) % currentTrajFrames.length];
 
-        // Desenha corpo
-        ctx.fillStyle = '#38bdf8';
-        (frame.corpo || []).forEach(pt => {
-          ctx.beginPath();
-          ctx.arc(pt.x * canvas.width, pt.y * canvas.height, 3, 0, Math.PI * 2);
-          ctx.fill();
-        });
+        // Centralização e escala de coordenadas:
+        // Formato S6 canônico: origem no centro dos ombros, unidade ~ largura dos ombros
+        // Formato legado de imagem: 0.0 a 1.0
+        const isS6Format = Array.isArray(frame.body) && (frame.left_hand !== undefined || frame.right_hand !== undefined);
 
-        // Desenha mãos
-        (frame.maos || []).forEach(mao => {
-          ctx.fillStyle = mao.lado === 'Right' ? '#34d399' : '#fbbf24';
-          (mao.keypoints || []).forEach(kp => {
+        if (isS6Format) {
+          const cx = canvas.width / 2;
+          const cy = canvas.height * 0.45;
+          const scale = canvas.height * 0.35;
+
+          // 1. Corpo / Pose (33 MediaPipe landmarks [x, y, z, vis])
+          ctx.fillStyle = '#38bdf8';
+          (frame.body || []).forEach(pt => {
+            if (Array.isArray(pt) && pt.length >= 2) {
+              const px = cx + pt[0] * scale;
+              const py = cy + pt[1] * scale;
+              ctx.beginPath();
+              ctx.arc(px, py, 2.5, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          });
+
+          // 2. Mão Direita (21 pontos [x, y, z])
+          if (Array.isArray(frame.right_hand)) {
+            ctx.fillStyle = '#34d399';
+            frame.right_hand.forEach(pt => {
+              if (Array.isArray(pt) && pt.length >= 2) {
+                const px = cx + pt[0] * scale;
+                const py = cy + pt[1] * scale;
+                ctx.beginPath();
+                ctx.arc(px, py, 3.2, 0, Math.PI * 2);
+                ctx.fill();
+              }
+            });
+          }
+
+          // 3. Mão Esquerda (21 pontos [x, y, z])
+          if (Array.isArray(frame.left_hand)) {
+            ctx.fillStyle = '#fbbf24';
+            frame.left_hand.forEach(pt => {
+              if (Array.isArray(pt) && pt.length >= 2) {
+                const px = cx + pt[0] * scale;
+                const py = cy + pt[1] * scale;
+                ctx.beginPath();
+                ctx.arc(px, py, 3.2, 0, Math.PI * 2);
+                ctx.fill();
+              }
+            });
+          }
+        } else {
+          // Fallback para formato legado de imagem com frame.corpo e frame.maos
+          ctx.fillStyle = '#38bdf8';
+          (frame.corpo || []).forEach(pt => {
             ctx.beginPath();
-            ctx.arc(kp.x * canvas.width, kp.y * canvas.height, 3.5, 0, Math.PI * 2);
+            ctx.arc(pt.x * canvas.width, pt.y * canvas.height, 3, 0, Math.PI * 2);
             ctx.fill();
           });
-        });
+
+          (frame.maos || []).forEach(mao => {
+            ctx.fillStyle = mao.lado === 'Right' ? '#34d399' : '#fbbf24';
+            (mao.keypoints || []).forEach(kp => {
+              ctx.beginPath();
+              ctx.arc(kp.x * canvas.width, kp.y * canvas.height, 3.5, 0, Math.PI * 2);
+              ctx.fill();
+            });
+          });
+        }
 
         currentTrajIndex = (currentTrajIndex + 0.5 * currentSpeedFactor) % currentTrajFrames.length;
       }

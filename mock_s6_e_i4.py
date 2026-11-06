@@ -118,7 +118,43 @@ class MockS6AndI4Service:
         }
 
     def _load_sample_avatar_frames(self) -> List[Dict[str, Any]]:
-        """Carrega quadros reais do repositório A6 para compor o arquivo de trajetória."""
+        """Carrega a trajetória padrão/oficial do S6 (template default de entrada do avatar).
+        
+        Prioriza o arquivo canônico do template S6: avatar/entry/6d9c234fcd35.json
+        com estrutura:
+          body: 33 landmarks [x, y, z, visibility]
+          left_hand: 21 landmarks [x, y, z] ou null
+          right_hand: 21 landmarks [x, y, z] ou null
+          face: 468 landmarks [x, y, z] ou null
+        """
+        # 1. Template default oficial de S6
+        template_canonical = Path(__file__).parent / "avatar" / "entry" / "6d9c234fcd35.json"
+        if not template_canonical.exists():
+            template_canonical = Path(__file__).parent / "avatar" / "entry" / "_processados" / "6d9c234fcd35.json"
+        
+        if template_canonical.exists():
+            try:
+                doc = json.loads(template_canonical.read_text(encoding="utf-8-sig"))
+                frames = doc.get("frames", [])
+                if isinstance(frames, list) and frames:
+                    log.info("Carregado template oficial S6 de %s com %d frames", template_canonical.name, len(frames))
+                    return frames
+            except Exception as exc:
+                log.warning("Falha ao ler template canônico S6 %s: %s", template_canonical, exc)
+
+        # 2. Outros JSONs válidos de avatar/entry ou _processados
+        for search_dir in [Path(__file__).parent / "avatar" / "entry", Path(__file__).parent / "avatar" / "entry" / "_processados"]:
+            if search_dir.exists():
+                for p in search_dir.glob("*.json"):
+                    try:
+                        doc = json.loads(p.read_text(encoding="utf-8-sig"))
+                        frames = doc.get("frames", [])
+                        if isinstance(frames, list) and frames and any("body" in f for f in frames[:5]):
+                            return frames
+                    except Exception:
+                        pass
+
+        # 3. Fallbacks legados
         sample_file = Path(__file__).parent / "saida_correcoes" / "exemplo_aluno_avatar.json"
         if sample_file.exists():
             try:
@@ -128,7 +164,6 @@ class MockS6AndI4Service:
             except Exception:
                 pass
 
-        # Fallback para frames reais de dataset_maos/keypoints
         kp_dir = Path(__file__).parent / "dataset_maos" / "keypoints"
         frames = []
         if kp_dir.exists():
@@ -138,7 +173,7 @@ class MockS6AndI4Service:
                     frames.append(self._ensure_s6_frame_format(raw))
                 except Exception:
                     pass
-        return frames or [{"body": [], "left_hand": None, "right_hand": None, "maos": [], "corpo": []}]
+        return frames or [{"body": [], "left_hand": None, "right_hand": None, "face": []}]
 
     def _generate_trajectory_file(
         self,
@@ -150,10 +185,11 @@ class MockS6AndI4Service:
         file_id = f"traj_{uuid.uuid4().hex[:10]}.json"
         out_path = self.trajectory_dir / file_id
 
-        # Repete/interpola os quadros de amostra para ter o tamanho correspondente aos sinais
+        # Seleciona ou replica os quadros para corresponder aos sinais sintetizados
         frames_out = []
         n_samples = len(self._sample_frames)
-        for i in range(max(1, total_frames)):
+        target_count = max(len(self._sample_frames), total_frames)
+        for i in range(target_count):
             frames_out.append(self._sample_frames[i % n_samples])
 
         trajectory_doc = {
