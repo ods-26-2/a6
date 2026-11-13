@@ -1,0 +1,74 @@
+{
+  "context_id": "frase-003",
+  "session_id": "web-realtime-session",
+  "signer_id": "signer-01",
+  "close_reason": "Silêncio/inatividade de 3.5s (fim da frase detectado)",
+  "started_at": "2026-11-13T15:52:14.580Z",
+  "ended_at": "2026-11-13T15:52:17.180Z",
+  "raw_gloss_sequence": [
+    "ALUNO",
+    "ONTEM",
+    "ESTUDAR"
+  ],
+  "grammatical_gloss_sequence": [
+    "ONTEM",
+    "ALUNO",
+    "ESTUDAR"
+  ],
+  "suggested_corrected_sentence": [
+    "HOJE",
+    "ALUNO",
+    "ESTUDAR"
+  ],
+  "was_syntactically_reordered": true,
+  "had_low_confidence_replacements": true,
+  "portuguese_sentence": "O aluno estuda.",
+  "facial_markers": [
+    "NEUTRO"
+  ],
+  "signs_detail": [
+    {
+      "gloss": "ALUNO",
+      "category": "SUJEITO",
+      "confidence": 0.92,
+      "needs_suggestion": false,
+      "top_suggestion": null,
+      "alternatives": [],
+      "start_at": "2026-11-13T15:52:14.580Z",
+      "end_at": "2026-11-13T15:52:15.680Z"
+    },
+    {
+      "gloss": "ONTEM",
+      "category": "TEMPO",
+      "confidence": 0.56,
+      "needs_suggestion": true,
+      "top_suggestion": "HOJE",
+      "alternatives": [
+        {
+          "gloss": "HOJE",
+          "confidence": 0.35,
+          "in_lexicon": true,
+          "source": "i4_alternatives"
+        },
+        {
+          "gloss": "AMANHA",
+          "confidence": 0.09,
+          "in_lexicon": true,
+          "source": "i4_alternatives"
+        }
+      ],
+      "start_at": "2026-11-13T15:52:16.080Z",
+      "end_at": "2026-11-13T15:52:17.180Z"
+    },
+    {
+      "gloss": "ESTUDAR",
+      "category": "VERBO",
+      "confidence": 0.89,
+      "needs_suggestion": false,
+      "top_suggestion": null,
+      "alternatives": [],
+      "start_at": "2026-11-13T15:52:16.080Z",
+      "end_at": "2026-11-13T15:52:17.180Z"
+    }
+  ]
+}

@@ -1,0 +1,61 @@
+{
+  "context_id": "frase-005",
+  "session_id": "web-realtime-session",
+  "signer_id": "signer-01",
+  "close_reason": "Silêncio/inatividade de 3.5s (fim da frase detectado)",
+  "started_at": "2026-11-13T15:45:04.763Z",
+  "ended_at": "2026-11-13T15:45:05.863Z",
+  "raw_gloss_sequence": [
+    "ONTEM",
+    "ESTUDAR"
+  ],
+  "grammatical_gloss_sequence": [
+    "ONTEM",
+    "ESTUDAR"
+  ],
+  "suggested_corrected_sentence": [
+    "HOJE",
+    "ESTUDAR"
+  ],
+  "was_syntactically_reordered": false,
+  "had_low_confidence_replacements": true,
+  "portuguese_sentence": null,
+  "facial_markers": [
+    "NEUTRO"
+  ],
+  "signs_detail": [
+    {
+      "gloss": "ONTEM",
+      "category": "TEMPO",
+      "confidence": 0.56,
+      "needs_suggestion": true,
+      "top_suggestion": "HOJE",
+      "alternatives": [
+        {
+          "gloss": "HOJE",
+          "confidence": 0.35,
+          "in_lexicon": true,
+          "source": "i4_alternatives"
+        },
+        {
+          "gloss": "AMANHA",
+          "confidence": 0.09,
+          "in_lexicon": true,
+          "source": "i4_alternatives"
+        }
+      ],
+      "start_at": "2026-11-13T15:45:04.763Z",
+      "end_at": "2026-11-13T15:45:05.863Z"
+    },
+    {
+      "gloss": "ESTUDAR",
+      "category": "VERBO",
+      "confidence": 0.89,
+      "needs_suggestion": false,
+      "top_suggestion": null,
+      "alternatives": [],
+      "start_at": "2026-11-13T15:45:04.763Z",
+      "end_at": "2026-11-13T15:45:05.863Z"
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "received_at_local": "2026-11-13T12:44:17.069667",
+  "raw_kafka_envelope": {
+    "message_id": "f40b509f-8796-442b-a83e-8da1cf296676",
+    "message_type": "event",
+    "schema": "ods.i4.sign",
+    "schema_version": "1.0",
+    "producer": "I4",
+    "published_at": "2026-11-13T15:44:05.600Z",
+    "occurred_at": "2026-11-13T15:44:05.600Z",
+    "payload": {
+      "sign": "ALUNO",
+      "confidence": 0.92,
+      "start_at": "2026-11-13T15:44:06.000Z",
+      "end_at": "2026-11-13T15:44:07.100Z",
+      "alternatives": [],
+      "signer_id": "signer-01"
+    },
+    "session_id": "web-realtime-session"
+  },
+  "a6_processed_result": {
+    "recognized_sign": "ALUNO",
+    "confidence": 0.92,
+    "in_lexicon": true,
+    "needs_correction_suggestion": false,
+    "status_message": "Sinal 'ALUNO' reconhecido com alta confiança (0.92).",
+    "suggested_alternatives": [],
+    "sentence_context": {
+      "accumulated_glosses": [
+        "ALUNO"
+      ],
+      "grammatical_order": [
+        "ALUNO"
+      ],
+      "was_reordered": false,
+      "portuguese_sentence": null,
+      "qwen3_generation": {
+        "status": "ERRO",
+        "model": null,
+        "error": "A API Qwen3 respondeu HTTP 429: Rate exceeded."
+      }
+    },
+    "context_tracking": {
+      "context_id": "frase-003",
+      "switched_to_new_context": false,
+      "previous_closed_context": null,
+      "active_glosses_in_context": [
+        "ALUNO"
+      ],
+      "active_grammatical_order": [
+        "ALUNO"
+      ]
+    }
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "received_at_local": "2026-11-13T11:22:12.787831",
+  "raw_kafka_envelope": {
+    "message_id": "a0c01678-4cb3-4a86-af7f-da4663af4c0c",
+    "message_type": "event",
+    "schema": "ods.i4.sign",
+    "schema_version": "1.0",
+    "producer": "I4",
+    "published_at": "2026-11-13T14:22:11.286Z",
+    "occurred_at": "2026-11-13T14:22:11.286Z",
+    "payload": {
+      "sign": "ONTEM",
+      "confidence": 0.56,
+      "start_at": "2026-11-13T14:22:08.618Z",
+      "end_at": "2026-11-13T14:22:09.718Z",
+      "alternatives": [
+        {
+          "sign": "HOJE",
+          "confidence": 0.35
+        },
+        {
+          "sign": "AMANHA",
+          "confidence": 0.09
+        }
+      ],
+      "signer_id": "signer-01"
+    },
+    "session_id": "web-realtime-session"
+  },
+  "a6_processed_result": {
+    "recognized_sign": "ONTEM",
+    "confidence": 0.56,
+    "in_lexicon": true,
+    "needs_correction_suggestion": true,
+    "status_message": "Baixa confiança (0.56 < 0.75) para 'ONTEM'. Oferecendo alternativas de I4.",
+    "suggested_alternatives": [
+      {
+        "gloss": "HOJE",
+        "confidence": 0.35,
+        "in_lexicon": true,
+        "source": "i4_alternatives"
+      },
+      {
+        "gloss": "AMANHA",
+        "confidence": 0.09,
+        "in_lexicon": true,
+        "source": "i4_alternatives"
+      }
+    ],
+    "sentence_context": {
+      "accumulated_glosses": [
+        "ALUNO",
+        "ALUNO",
+        "ESTUDAR",
+        "ESTUDAR",
+        "ONTEM"
+      ],
+      "grammatical_order": [
+        "ONTEM",
+        "ALUNO",
+        "ALUNO",
+        "ESTUDAR",
+        "ESTUDAR"
+      ],
+      "was_reordered": true,
+      "portuguese_sentence": null,
+      "qwen3_generation": {
+        "status": "ERRO",
+        "model": null,
+        "error": "QWEN3_API_URL não configurada. Informe a URL do serviço Cloud Run."
+      }
+    },
+    "context_tracking": {
+      "context_id": "frase-002",
+      "switched_to_new_context": false,
+      "previous_closed_context": null,
+      "active_glosses_in_context": [
+        "ALUNO",
+        "ALUNO",
+        "ESTUDAR",
+        "ESTUDAR",
+        "ONTEM"
+      ],
+      "active_grammatical_order": [
+        "ONTEM",
+        "ALUNO",
+        "ALUNO",
+        "ESTUDAR",
+        "ESTUDAR"
+      ]
+    }
+  }
+}

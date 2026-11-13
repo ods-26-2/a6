@@ -1,0 +1,25 @@
+{
+  "received_at_local": "2026-11-13T11:38:19.155801",
+  "raw_kafka_envelope": {
+    "message_id": "af6ae68d-6c9a-4206-87bf-ee655a4cee28",
+    "message_type": "event",
+    "schema": "ods.i4.facial_marker",
+    "schema_version": "1.0",
+    "producer": "I4",
+    "published_at": "2026-11-13T14:38:19.155Z",
+    "occurred_at": "2026-11-13T14:38:19.155Z",
+    "payload": {
+      "marker": "INTERROGATIVA_SN",
+      "confidence": 0.88,
+      "start_at": "2026-11-13T14:38:11.103Z",
+      "end_at": "2026-11-13T14:38:12.203Z"
+    },
+    "session_id": "web-realtime-session"
+  },
+  "a6_processed_result": {
+    "marker": "INTERROGATIVA_SN",
+    "confidence": 0.88,
+    "start_at": "2026-11-13T14:38:11.103Z",
+    "end_at": "2026-11-13T14:38:12.203Z"
+  }
+}

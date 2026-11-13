@@ -43,7 +43,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("a6.libras.kafka")
 
-DEFAULT_BOOTSTRAP = "34.66.235.91:9093"
+DEFAULT_BOOTSTRAP = "200.17.66.56:9093"
 DEFAULT_GROUP_ID = "A6-libras-correcao"
 PRODUCER_ID = "A6"
 SCHEMA_VERSION = "1.0"
@@ -275,6 +275,7 @@ class SentenceContextAggregator:
             ctx["last_end_at_iso"] = end_iso
         if end_epoch is not None:
             ctx["last_end_epoch"] = end_epoch
+        ctx["last_portuguese_sentence"] = eval_result.get("sentence_context", {}).get("portuguese_sentence")
         ctx["last_wallclock_time"] = time.time()
 
         return closed_prev, ctx
@@ -315,6 +316,7 @@ class SentenceContextAggregator:
             "suggested_corrected_sentence": reordered_suggested,
             "was_syntactically_reordered": was_reordered,
             "had_low_confidence_replacements": raw_glosses != glosses_with_suggestions,
+            "portuguese_sentence": ctx.get("last_portuguese_sentence"),
             "facial_markers": ctx["facial_markers"] or ["NEUTRO"],
             "signs_detail": ctx["signs_detail"],
         }

@@ -1,0 +1,55 @@
+{
+  "received_at_local": "2026-11-13T12:43:48.555409",
+  "raw_kafka_envelope": {
+    "message_id": "3246b709-99b5-47f5-b18e-403a2569938a",
+    "message_type": "event",
+    "schema": "ods.i4.sign",
+    "schema_version": "1.0",
+    "producer": "I4",
+    "published_at": "2026-11-13T15:43:36.953Z",
+    "occurred_at": "2026-11-13T15:43:36.953Z",
+    "payload": {
+      "sign": "ALUNO",
+      "confidence": 0.92,
+      "start_at": "2026-11-13T15:43:37.353Z",
+      "end_at": "2026-11-13T15:43:38.453Z",
+      "alternatives": [],
+      "signer_id": "signer-01"
+    },
+    "session_id": "web-realtime-session"
+  },
+  "a6_processed_result": {
+    "recognized_sign": "ALUNO",
+    "confidence": 0.92,
+    "in_lexicon": true,
+    "needs_correction_suggestion": false,
+    "status_message": "Sinal 'ALUNO' reconhecido com alta confiança (0.92).",
+    "suggested_alternatives": [],
+    "sentence_context": {
+      "accumulated_glosses": [
+        "ALUNO"
+      ],
+      "grammatical_order": [
+        "ALUNO"
+      ],
+      "was_reordered": false,
+      "portuguese_sentence": null,
+      "qwen3_generation": {
+        "status": "ERRO",
+        "model": null,
+        "error": "A API Qwen3 respondeu HTTP 500: \n<html><head>\n<meta http-equiv=\"content-type\" content=\"text/html;charset=utf-8\">\n<title>500 Server Error</title>\n</head>\n<body text=#000000 bgcolor=#ffffff>\n<h1>Error: Server Error</h1>\n<h2>The server encountered an error and could not complete your request.<p>Please try again in 30 seconds.</h2>\n<h2></h2>\n</body></html>\n"
+      }
+    },
+    "context_tracking": {
+      "context_id": "frase-001",
+      "switched_to_new_context": false,
+      "previous_closed_context": null,
+      "active_glosses_in_context": [
+        "ALUNO"
+      ],
+      "active_grammatical_order": [
+        "ALUNO"
+      ]
+    }
+  }
+}

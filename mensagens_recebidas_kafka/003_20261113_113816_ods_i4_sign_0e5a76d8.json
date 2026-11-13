@@ -1,0 +1,81 @@
+{
+  "received_at_local": "2026-11-13T11:38:16.561401",
+  "raw_kafka_envelope": {
+    "message_id": "0e5a76d8-3060-4605-8204-3c4e42674318",
+    "message_type": "event",
+    "schema": "ods.i4.sign",
+    "schema_version": "1.0",
+    "producer": "I4",
+    "published_at": "2026-11-13T14:38:04.527Z",
+    "occurred_at": "2026-11-13T14:38:04.527Z",
+    "payload": {
+      "sign": "ONTEM",
+      "confidence": 0.56,
+      "start_at": "2026-11-13T14:38:04.927Z",
+      "end_at": "2026-11-13T14:38:06.027Z",
+      "alternatives": [
+        {
+          "sign": "HOJE",
+          "confidence": 0.35
+        },
+        {
+          "sign": "AMANHA",
+          "confidence": 0.09
+        }
+      ],
+      "signer_id": "signer-01"
+    },
+    "session_id": "web-realtime-session"
+  },
+  "a6_processed_result": {
+    "recognized_sign": "ONTEM",
+    "confidence": 0.56,
+    "in_lexicon": true,
+    "needs_correction_suggestion": true,
+    "status_message": "Baixa confiança (0.56 < 0.75) para 'ONTEM'. Oferecendo alternativas de I4.",
+    "suggested_alternatives": [
+      {
+        "gloss": "HOJE",
+        "confidence": 0.35,
+        "in_lexicon": true,
+        "source": "i4_alternatives"
+      },
+      {
+        "gloss": "AMANHA",
+        "confidence": 0.09,
+        "in_lexicon": true,
+        "source": "i4_alternatives"
+      }
+    ],
+    "sentence_context": {
+      "accumulated_glosses": [
+        "ONTEM"
+      ],
+      "grammatical_order": [
+        "ONTEM"
+      ],
+      "was_reordered": false,
+      "portuguese_sentence": null,
+      "qwen3_generation": {
+        "status": "ERRO",
+        "model": null,
+        "error": "A API Qwen3 respondeu HTTP 429: Rate exceeded."
+      }
+    },
+    "context_tracking": {
+      "context_id": "frase-001",
+      "switched_to_new_context": false,
+      "previous_closed_context": null,
+      "active_glosses_in_context": [
+        "ESTUDAR",
+        "ESTUDAR",
+        "ONTEM"
+      ],
+      "active_grammatical_order": [
+        "ONTEM",
+        "ESTUDAR",
+        "ESTUDAR"
+      ]
+    }
+  }
+}

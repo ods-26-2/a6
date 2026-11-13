@@ -166,30 +166,41 @@ class A6ApplicationBackend:
         traj_filename = traj_ref.split("/")[-1] if "/" in traj_ref else ""
         traj_path = self.mock_service.trajectory_dir / traj_filename
         traj_frames = []
+        glb_url = "/avatar/saida/aluno_corrigido.glb"
+
         if traj_path.exists():
             try:
                 traj_doc = json.loads(traj_path.read_text(encoding="utf-8"))
-                traj_frames = traj_doc.get("frames", [])[:90]
+                traj_frames = traj_doc.get("frames", [])
             except Exception:
                 pass
 
-            # Gera o .glb animado em background para visualização 3D imediata no site
-            def _gerar_glb():
+            # Gera o .glb animado para o avatar 3D no navegador
+            candidatos_py = [
+                BASE_DIR / ".venv" / "blender" / "bin" / "python",
+                BASE_DIR / ".venv" / "blender" / "Scripts" / "python.exe",
+                BASE_DIR / "envs" / "blender" / "bin" / "python",
+                BASE_DIR / "envs" / "blender" / "Scripts" / "python.exe",
+            ]
+            py_blender = next((str(p) for p in candidatos_py if p.exists() or p.is_symlink()), None)
+            if py_blender:
                 try:
-                    candidatos_py = [
-                        BASE_DIR / ".venv" / "blender" / "bin" / "python",
-                        BASE_DIR / ".venv" / "blender" / "Scripts" / "python.exe",
-                        BASE_DIR / "envs" / "blender" / "bin" / "python",
-                        BASE_DIR / "envs" / "blender" / "Scripts" / "python.exe",
-                    ]
-                    py_blender = next((str(p) for p in candidatos_py if p.exists() or p.is_symlink()), None)
-                    if py_blender:
-                        cmd = [py_blender, str(BASE_DIR / "avatar" / "generate_video.py"), "--arquivo", str(traj_path)]
-                        subprocess.run(cmd, timeout=60)
+                    cmd = [py_blender, str(BASE_DIR / "avatar" / "generate_video.py"), "--arquivo", str(traj_path)]
+                    log.info("Sintetizando avatar 3D para a nova trajetória '%s'...", traj_path.name)
+                    t0 = time.time()
+                    proc = subprocess.run(cmd, timeout=30, capture_output=True, text=True)
+                    dt = time.time() - t0
+                    if proc.returncode == 0:
+                        target_glb = BASE_DIR / "avatar" / "saida" / f"{traj_path.stem}.glb"
+                        if target_glb.exists():
+                            glb_url = f"/avatar/saida/{traj_path.stem}.glb"
+                        else:
+                            glb_url = f"/avatar/saida/aluno_corrigido.glb?t={int(time.time()*1000)}"
+                        log.info("Avatar 3D (.glb) gerado com sucesso em %.1fs: %s", dt, glb_url)
+                    else:
+                        log.warning("generate_video.py falhou (código %d): %s", proc.returncode, proc.stderr)
                 except Exception as exc:
-                    log.warning("Falha ao disparar generate_video.py pelo servidor web: %s", exc)
-
-            threading.Thread(target=_gerar_glb, daemon=True).start()
+                    log.warning("Falha ao gerar GLB com Blender: %s", exc)
 
         record = {
             "timestamp": time.strftime("%H:%M:%S"),
@@ -198,6 +209,8 @@ class A6ApplicationBackend:
             "s6_reply_payload": reply_payload,
             "s6_reply_evaluation": eval_reply,
             "trajectory_preview_frames": traj_frames,
+            "trajectory_filename": traj_filename,
+            "glb_url": glb_url,
         }
         with self._lock:
             self.synthesis_history.insert(0, record)
@@ -328,6 +341,7 @@ class A6ApplicationBackend:
                 "session_id": sid,
                 "raw_glosses": ctx["glosses"],
                 "grammatical_order": reordered,
+                "portuguese_sentence": ctx.get("last_portuguese_sentence"),
                 "facial_markers": ctx["facial_markers"] or ["NEUTRO"],
                 "signs_detail": ctx["signs_detail"],
             })
@@ -444,7 +458,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <h2>1. Português ➔ LIBRAS (Comando p/ S6 + Pré-Validação)</h2>
       <div>
         <label>Digite uma frase em Português (ou glosas fora do léxico para testar a Sugestão):</label>
-        <input type="text" id="ptInput" value="Amanhã o estudante desejar estudar no colégio?" />
+        <input type="text" id="ptInput" value="Amanhã o estudante desejar estudar no colégio?" onkeydown="if(event.key==='Enter') translatePtToLibras();" />
       </div>
       <div class="row">
         <div style="flex:1;">
@@ -466,7 +480,7 @@ INDEX_HTML = """<!DOCTYPE html>
         </div>
       </div>
       <div class="row">
-        <button onclick="translatePtToLibras()" style="flex:2;">🚀 Pré-Validar e Enviar `ods.s6.synthesis.command`</button>
+        <button id="translateBtn" onclick="translatePtToLibras()" style="flex:2;">🚀 Pré-Validar e Enviar `ods.s6.synthesis.command`</button>
         <button class="secondary" onclick="testUnknownSignFallback()" title="Envia palavra fora do léxico sem substituir antes para testar unknown_signs do S6">Testar `unknown_signs`</button>
       </div>
 
@@ -643,6 +657,7 @@ INDEX_HTML = """<!DOCTYPE html>
               <div><b>ID do Contexto:</b> <span class="badge">${ctx.context_id}</span> | <b>Marcadores:</b> <span class="pill marker">${ctx.facial_markers.join(', ')}</span></div>
               <div style="margin-top:6px;"><b>Sinais recebidos:</b> ${detailsHtml}</div>
               <div style="margin-top:6px;"><b>Ordem Gramatical [T+S+O+V]:</b> <span class="pill gloss">${ctx.grammatical_order.join(' ➔ ')}</span></div>
+              ${ctx.portuguese_sentence ? `<div style="margin-top:6px; color:var(--ok);">💬 <b>Tradução IA (Qwen3 4B):</b> "${ctx.portuguese_sentence}"</div>` : ''}
             `;
           }).join('<hr style="margin:8px 0;border-color:var(--border);"/>');
         }
@@ -657,6 +672,7 @@ INDEX_HTML = """<!DOCTYPE html>
               <div><span class="badge ok">${c.context_id}</span> <span style="font-size:0.78rem;color:var(--muted);">${c.close_reason}</span></div>
               <div style="margin-top:4px;"><b>Recebido:</b> <code>${c.raw_gloss_sequence.join(' ')}</code> ➔ <b>Gramática Libras:</b> <span class="pill gloss">${c.grammatical_gloss_sequence.join(' ')}</span></div>
               ${c.had_low_confidence_replacements ? `<div style="margin-top:3px;color:var(--warn);">💡 <b>Frase c/ Sugestão de Baixa Confiança:</b> <code>${c.suggested_corrected_sentence.join(' ')}</code></div>` : ''}
+              ${c.portuguese_sentence ? `<div style="margin-top:3px; color:var(--ok);">💬 <b>Frase em Português (Qwen3 4B):</b> "${c.portuguese_sentence}"</div>` : ''}
               <div style="font-size:0.78rem; color:var(--accent);">Marcadores Faciais: ${c.facial_markers.join(', ')}</div>
             </div>
           `).join('');
@@ -668,14 +684,26 @@ INDEX_HTML = """<!DOCTYPE html>
       const text = document.getElementById('ptInput').value;
       const speed = parseFloat(document.getElementById('speedInput').value) || 1.0;
       const marker = document.getElementById('markerSelect').value;
+      const btn = document.getElementById('translateBtn');
+      if (btn) {
+        btn.disabled = true;
+        btn.innerText = "⏳ Sintetizando no S6 & Gerando Avatar 3D...";
+      }
 
-      const res = await fetch('/api/translate', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({text, speed_factor: speed, explicit_marker: marker})
-      });
-      const data = await res.json();
-      renderS6Result(data);
+      try {
+        const res = await fetch('/api/translate', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({text, speed_factor: speed, explicit_marker: marker})
+        });
+        const data = await res.json();
+        renderS6Result(data);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerText = "🚀 Pré-Validar e Enviar `ods.s6.synthesis.command`";
+        }
+      }
     }
 
     async function testUnknownSignFallback() {
@@ -730,20 +758,34 @@ INDEX_HTML = """<!DOCTYPE html>
         document.getElementById('trajStatus').innerText = `Reproduzindo ${currentTrajFrames.length} frames (${rpl.fps} FPS)`;
       }
 
-      // Atualiza o model-viewer com o novo .glb assim que terminar de exportar
-      setTimeout(() => {
+      // Atualiza o model-viewer com o novo .glb retornado pelo servidor
+      if (data.glb_url) {
         const viewer = document.getElementById('avatarViewer');
+        const glbSelect = document.getElementById('glbSelect');
+        const glosses = (prep.s6_command_payload && prep.s6_command_payload.glosses) ? prep.s6_command_payload.glosses.join(' ') : 'Frase';
+
+        if (glbSelect) {
+          const itemText = `Trajetória: ${glosses} (${data.trajectory_filename || 'recente'})`;
+          let opt = Array.from(glbSelect.options).find(o => o.value === data.glb_url);
+          if (!opt) {
+            opt = document.createElement('option');
+            opt.value = data.glb_url;
+            opt.innerText = itemText;
+            glbSelect.insertBefore(opt, glbSelect.firstChild);
+          }
+          glbSelect.value = data.glb_url;
+        }
+
         if (viewer) {
-          viewer.src = `/avatar/saida/aluno_corrigido.glb?t=${Date.now()}`;
+          viewer.src = data.glb_url;
           viewer.currentTime = 0;
           try {
-            viewer.animationName = 'ArmatureAction';
             viewer.play({ repetitions: 1 });
           } catch (e) {
             viewer.play();
           }
         }
-      }, 1600);
+      }
     }
 
     async function sendI4Sign(sign, confidence, alternatives, facial_marker, gap_seconds) {
@@ -988,15 +1030,18 @@ def main():
     )
     A6HTTPRequestHandler.backend = backend
 
-    # Dispara uma primeira síntese de exemplo para já deixar o player populado ao abrir
-    backend.translate_pt_to_libras("Amanhã o estudante desejar estudar no colégio?", speed_factor=1.0)
-
     server = ThreadingHTTPServer((args.host, args.port), A6HTTPRequestHandler)
     log.info("=" * 72)
     log.info(" SERVIDOR WEB A6 INICIADO COM SUCESSO!")
     log.info(" -> Acesse no navegador: http://localhost:%d", args.port)
     log.info(" -> Broker Kafka configurado: %s", get_bootstrap_servers())
     log.info("=" * 72)
+
+    # Popula exemplo inicial em background sem travar a abertura imediata da porta HTTP
+    threading.Thread(
+        target=lambda: backend.translate_pt_to_libras("Amanhã o estudante desejar estudar no colégio?", speed_factor=1.0),
+        daemon=True,
+    ).start()
 
     try:
         server.serve_forever()

@@ -30,13 +30,21 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import signal
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from confluent_kafka import Consumer, KafkaError, Producer
+try:
+    from confluent_kafka import Consumer, KafkaError, Producer
+    HAS_CONFLUENT_KAFKA = True
+except ImportError:
+    HAS_CONFLUENT_KAFKA = False
+    Consumer = None
+    KafkaError = None
+    Producer = None
 from kafka_integration import (
     TOPIC_I4_CAPTURE_CMD,
     TOPIC_I4_CAPTURE_RPL,
@@ -185,12 +193,82 @@ class MockS6AndI4Service:
         file_id = f"traj_{uuid.uuid4().hex[:10]}.json"
         out_path = self.trajectory_dir / file_id
 
-        # Seleciona ou replica os quadros para corresponder aos sinais sintetizados
-        frames_out = []
-        n_samples = len(self._sample_frames)
-        target_count = max(len(self._sample_frames), total_frames)
-        for i in range(target_count):
-            frames_out.append(self._sample_frames[i % n_samples])
+        kp_dir = Path(__file__).parent / "dataset_maos" / "keypoints"
+        d_files = sorted(kp_dir.glob("d*.json")) if kp_dir.exists() else []
+        l_files = sorted(kp_dir.glob("l*.json")) if kp_dir.exists() else []
+        aspect = 1280.0 / 720.0
+
+        gloss_list = known_glosses or ["ALUNO"]
+        frames_per_sign = max(12, int(round(total_frames / max(1, len(gloss_list)))))
+        frames_out: List[Dict[str, Any]] = []
+
+        for g_idx, gloss in enumerate(gloss_list):
+            raw_d = None
+            raw_l = None
+            if d_files:
+                d_idx = abs(hash(gloss)) % len(d_files)
+                try:
+                    raw_d = json.loads(d_files[d_idx].read_text(encoding="utf-8-sig"))
+                except Exception:
+                    pass
+            if l_files and (abs(hash(gloss)) % 3 == 0):
+                l_idx = abs(hash(gloss)) % len(l_files)
+                try:
+                    raw_l = json.loads(l_files[l_idx].read_text(encoding="utf-8-sig"))
+                except Exception:
+                    pass
+
+            base_r = None
+            maos_preview = []
+            if raw_d and raw_d.get("maos"):
+                m0 = raw_d["maos"][0]
+                kps = sorted(m0.get("keypoints", []), key=lambda k: k.get("id", 0))
+                if len(kps) >= 21:
+                    base_r = [[float(k["x"]) * aspect, float(k["y"]), float(k["z"]) * aspect] for k in kps[:21]]
+                    maos_preview.append(m0)
+
+            base_l = None
+            if raw_l and raw_l.get("maos"):
+                m1 = raw_l["maos"][0]
+                kps_l = sorted(m1.get("keypoints", []), key=lambda k: k.get("id", 0))
+                if len(kps_l) >= 21:
+                    base_l = [[float(k["x"]) * aspect, float(k["y"]), float(k["z"]) * aspect] for k in kps_l[:21]]
+                    m1_copy = dict(m1)
+                    m1_copy["lado"] = "Left"
+                    maos_preview.append(m1_copy)
+
+            if not base_r and self._sample_frames:
+                sample_idx = g_idx % len(self._sample_frames)
+                base_r = self._sample_frames[sample_idx].get("left_hand") or self._sample_frames[sample_idx].get("right_hand")
+
+            if not base_r:
+                base_r = [[0.8, 0.5, 0.0] for _ in range(21)]
+
+            for step in range(frames_per_sign):
+                t = step / max(1, frames_per_sign - 1)
+                bob_y = -0.05 * math.sin(t * math.pi)
+                sway_x = 0.02 * math.cos(t * math.pi)
+
+                cur_r = [[p[0] + sway_x, p[1] + bob_y, p[2]] for p in base_r]
+                cur_l = [[p[0] - sway_x, p[1] + bob_y, p[2]] for p in base_l] if base_l else None
+
+                cur_maos = []
+                for m in maos_preview:
+                    cur_maos.append({
+                        "lado": m.get("lado", "Right"),
+                        "keypoints": [
+                            {"id": k["id"], "x": k["x"] + sway_x * 0.5, "y": k["y"] + bob_y, "z": k.get("z", 0.0)}
+                            for k in m.get("keypoints", [])
+                        ]
+                    })
+
+                frames_out.append({
+                    "body": [],
+                    "left_hand": cur_r,
+                    "right_hand": cur_l,
+                    "maos": cur_maos,
+                    "corpo": [],
+                })
 
         trajectory_doc = {
             "fps": effective_fps,
@@ -344,6 +422,9 @@ class MockS6AndI4Service:
         return reply_payload
 
     def initialize(self):
+        if not HAS_CONFLUENT_KAFKA:
+            log.info("confluent_kafka não instalado. Mock S6 + I4 funcionando em modo direto (in-memory).")
+            return
         log.info("Iniciando Mock S6 + I4 conectado ao broker %s", self.bootstrap)
         self._consumer = Consumer({
             "bootstrap.servers": self.bootstrap,
@@ -422,9 +503,15 @@ class MockS6AndI4Service:
 
     def run(self):
         self.initialize()
+        if not HAS_CONFLUENT_KAFKA or not self._consumer:
+            log.info("Mock S6 + I4 aguardando em modo direto local.")
+            return
         self._running = True
-        signal.signal(signal.SIGINT, self.stop)
-        signal.signal(signal.SIGTERM, self.stop)
+        try:
+            signal.signal(signal.SIGINT, self.stop)
+            signal.signal(signal.SIGTERM, self.stop)
+        except ValueError:
+            pass  # Rodando em thread de background (ex: servidor_a6)
 
         log.info("Mock S6 + I4 pronto! Aguardando comandos de A6 (poll=1.0s)...")
         try:
